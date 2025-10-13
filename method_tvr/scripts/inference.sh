@@ -4,7 +4,7 @@
 # bash method/scripts/inference.sh ANY_OTHER_PYTHON_ARGS
 model_dir=$1
 eval_split_name=$2  # [val]
-eval_path=data/tvr_${eval_split_name}_release.jsonl
+eval_path=data/TVR/tvr_${eval_split_name}_release.jsonl
 tasks=()
 tasks+=(VCMR)
 tasks+=(SVMR)

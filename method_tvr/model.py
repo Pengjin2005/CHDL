@@ -546,16 +546,16 @@ class ReLoCLNet(nn.Module):
             sub_query = torch.zeros_like(video_query)
 
         # # 4) 起止概率：无字幕时仅用 video 相似度
-        # similarity = self.get_merged_score(video_query, video_feat, sub_query if use_sub_now else None, sub_feat if use_sub_now else None, cross=cross)
-        # st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, video_mask, cross=cross)
+        similarity = self.get_merged_score(video_query, video_feat, sub_query if use_sub_now else None, sub_feat if use_sub_now else None, cross=cross)
+        st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, video_mask, cross=cross)
 
-        pairwise = (video_feat.size(0) != encoded_query.size(0))
-        st_prob, ed_prob = self.moment(
-            video_feat, video_mask,
-            sub_feat,   sub_mask,
-            encoded_query, query_mask,
-            pairwise,
-        )
+        # pairwise = (video_feat.size(0) != encoded_query.size(0))
+        # st_prob, ed_prob = self.moment(
+        #     video_feat, video_mask,
+        #     sub_feat,   sub_mask,
+        #     encoded_query, query_mask,
+        #     pairwise,
+        # )
 
         if return_query_feats:
             return video_query, sub_query, encoded_query, q2ctx_scores, st_prob, ed_prob, reg
@@ -576,8 +576,7 @@ class ReLoCLNet(nn.Module):
         # impossibly large for cosine similarity, the copy is created as modifying the original will cause error
         query_context_scores_masked[diagonal_indices, diagonal_indices] = 999
         pos_query_neg_context_scores = self.get_neg_scores(query_context_scores, query_context_scores_masked)
-        neg_query_pos_context_scores = self.get_neg_scores(query_context_scores.transpose(0, 1),
-                                                           query_context_scores_masked.transpose(0, 1))
+        neg_query_pos_context_scores = self.get_neg_scores(query_context_scores.transpose(0, 1), query_context_scores_masked.transpose(0, 1))
         loss_neg_ctx = self.get_ranking_loss(pos_scores, pos_query_neg_context_scores)
         loss_neg_q = self.get_ranking_loss(pos_scores, neg_query_pos_context_scores)
         return loss_neg_ctx, loss_neg_q
@@ -595,8 +594,7 @@ class ReLoCLNet(nn.Module):
         sample_min_idx = 1  # skip the masked positive
         sample_max_idx = min(sample_min_idx + self.config.hard_pool_size, bsz) if self.config.use_hard_negative else bsz
         # (N, )
-        sampled_neg_score_indices = sorted_scores_indices[batch_indices, torch.randint(sample_min_idx, sample_max_idx,
-                                                                                       size=(bsz,)).to(scores.device)]
+        sampled_neg_score_indices = sorted_scores_indices[batch_indices, torch.randint(sample_min_idx, sample_max_idx, size=(bsz,)).to(scores.device)]
         sampled_neg_scores = scores[batch_indices, sampled_neg_score_indices]  # (N, )
         return sampled_neg_scores
 

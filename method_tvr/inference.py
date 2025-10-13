@@ -105,18 +105,6 @@ def get_submission_top_n(submission, top_n=100):
             top_n_submission[k] = get_prediction_top_n(submission[k], top_n)
     return top_n_submission
 
-def _masked_mean_pool(feat, mask):
-    """
-    feat: (N, L, H), mask: (N, L) with 1 for valid
-    return: (N, H)
-    """
-    if feat is None or mask is None:
-        return None
-    m = mask.unsqueeze(-1).float()              # (N, L, 1)
-    s = (feat * m).sum(dim=1)                   # (N, H)
-    d = m.sum(dim=1).clamp_min(1e-6)            # (N, 1)
-    return s / d
-
 
 def compute_context_info(model, eval_dataset, opt):
     """Use val set to do evaluation, remember to run with torch.no_grad().
@@ -204,9 +192,15 @@ def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_bef
             query_metas.extend(batch[0])
             model_inputs = prepare_batch_inputs(batch[1], device=opt.device, non_blocking=opt.pin_memory)
             # query_context_scores (_N_q, N_videos), st_prob, ed_prob (_N_q, L)
-            query2video_meta_indices = torch.tensor([svmr_video2meta_idx[e["vid_name"]] for e in _query_metas], dtype=torch.long, requires_grad=False)
+            query2video_meta_indices = torch.tensor([svmr_video2meta_idx[e["vid_name"]] for e in _query_metas],
+                                                    dtype=torch.long, requires_grad=False)
             _query_context_scores, _st_probs, _ed_probs = \
-                model.get_pred_from_raw_query(model_inputs["query_feat"], model_inputs["query_mask"], index_if_not_none(ctx_info["video_feat"], query2video_meta_indices), index_if_not_none(ctx_info["video_mask"], query2video_meta_indices), index_if_not_none(ctx_info["sub_feat"], query2video_meta_indices), index_if_not_none(ctx_info["sub_mask"], query2video_meta_indices), cross=False)
+                model.get_pred_from_raw_query(model_inputs["query_feat"], model_inputs["query_mask"],
+                                            index_if_not_none(ctx_info["video_feat"], query2video_meta_indices),
+                                            index_if_not_none(ctx_info["video_mask"], query2video_meta_indices),
+                                            index_if_not_none(ctx_info["sub_feat"], query2video_meta_indices),
+                                            index_if_not_none(ctx_info["sub_mask"], query2video_meta_indices),
+                                            cross=False)
             _query_context_scores = _query_context_scores + 1  # move cosine similarity to [0, 2]
 
             # normalize to get true probabilities!!!
@@ -233,7 +227,9 @@ def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_bef
         torch.cuda.synchronize()
         svmr_gt_st_probs = svmr_gt_st_probs.numpy()
         svmr_gt_ed_probs = svmr_gt_ed_probs.numpy()
-        svmr_res = get_svmr_res_from_st_ed_probs(svmr_gt_st_probs, svmr_gt_ed_probs, query_metas, video2idx, clip_length=opt.clip_length, min_pred_l=opt.min_pred_l, max_pred_l=opt.max_pred_l, max_before_nms=max_before_nms)
+        svmr_res = get_svmr_res_from_st_ed_probs(svmr_gt_st_probs, svmr_gt_ed_probs, query_metas, video2idx,
+                                                clip_length=opt.clip_length, min_pred_l=opt.min_pred_l,
+                                                max_pred_l=opt.max_pred_l, max_before_nms=max_before_nms)
     return dict(SVMR=svmr_res)
 
 
@@ -302,266 +298,149 @@ def load_external_vr_res2(external_vr_res_path, top_n_vr_videos=5):
     query2video = {e["desc_id"]: e["predictions"] for e in external_vr_res}
     return query2video
 
-import contextlib
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-@torch.no_grad()
 def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=1000, max_n_videos=100, tasks=("SVMR",)):
+    """Use val set to do evaluation, remember to run with torch.no_grad().
+    estimated size 20,000 (query) * 500 (hsz) * 4 / (1024**2) = 38.15 MB
+    max_n_videos: int, use max_n_videos videos for computing VCMR/VR results
     """
-    兼容原始返回：{ "SVMR": [...], "VCMR": [...], "VR": [...] }（去掉空项）
-    主要优化：
-      - 预分配 pinned CPU tensor + 独立 CUDA stream 做异步 D2H
-      - 先 topk 再对前 k 个做 exp（节省 O(N_videos) 指数）
-      - 使用 gather 选取 SVMR GT 行，避免跨设备高级索引
-      - offset 写位，避免 idx*bsz 对最后一批的假设
-      - 缓存 VCMR 的长度掩码
-    """
-    # ---- 任务标志 ----
     is_svmr = "SVMR" in tasks
     is_vr = "VR" in tasks
     is_vcmr = "VCMR" in tasks
-
-    # ---- 准备数据/loader ----
     video2idx = eval_dataset.video2idx
     video_metas = ctx_info["video_metas"]
     video_idx2meta_idx = None
     external_query2video = None
-
     model.eval()
     eval_dataset.set_data_mode("query")
     eval_dataset.load_gt_vid_name_for_query(is_svmr)
-
-    query_eval_loader = DataLoader(
-        eval_dataset,
-        collate_fn=start_end_collate,
-        batch_size=opt.eval_query_bsz,
-        num_workers=opt.num_workers,
-        shuffle=False,
-        pin_memory=opt.pin_memory,
-        persistent_workers=True if getattr(opt, "num_workers", 0) > 0 else False,
-    )
-
-    device = torch.device(opt.device)
-    use_amp = bool(getattr(opt, "use_amp", True) and device.type == "cuda")
-
+    query_eval_loader = DataLoader(eval_dataset, collate_fn=start_end_collate, batch_size=opt.eval_query_bsz, num_workers=opt.num_workers, shuffle=False, pin_memory=opt.pin_memory)
     n_total_query = len(eval_dataset)
-    ctx_len = int(getattr(opt, "max_ctx_l", eval_dataset.max_ctx_len))
+    bsz = opt.eval_query_bsz
 
-    # ---- 预分配 pinned CPU 缓冲（循环内异步写入，循环后一次性 numpy） ----
     if is_vcmr:
-        flat_st_ed_scores_sorted_indices_t = torch.empty((n_total_query, max_before_nms), dtype=torch.int64, device="cpu", pin_memory=True)
-        flat_st_ed_sorted_scores_t         = torch.empty((n_total_query, max_before_nms), dtype=torch.float32, device="cpu", pin_memory=True)
+        flat_st_ed_scores_sorted_indices = np.empty((n_total_query, max_before_nms), dtype=np.int32)
+        flat_st_ed_sorted_scores = np.zeros((n_total_query, max_before_nms), dtype=np.float32)
     else:
-        flat_st_ed_scores_sorted_indices_t, flat_st_ed_sorted_scores_t = None, None
+        flat_st_ed_scores_sorted_indices, flat_st_ed_sorted_scores = None, None
 
     if is_vr or is_vcmr:
-        sorted_q2c_indices_t = torch.empty((n_total_query, max_n_videos), dtype=torch.int64, device="cpu", pin_memory=True)
-        sorted_q2c_scores_t  = torch.empty((n_total_query, max_n_videos), dtype=torch.float32, device="cpu", pin_memory=True)
+        sorted_q2c_indices = np.empty((n_total_query, max_n_videos), dtype=np.int32)
+        sorted_q2c_scores = np.empty((n_total_query, max_n_videos), dtype=np.float32)
     else:
-        sorted_q2c_indices_t, sorted_q2c_scores_t = None, None
+        sorted_q2c_indices, sorted_q2c_scores = None, None
 
     if is_svmr:
         svmr_video2meta_idx = {e["vid_name"]: idx for idx, e in enumerate(video_metas)}
-        svmr_gt_st_probs_t = torch.zeros((n_total_query, ctx_len), dtype=torch.float32, device="cpu", pin_memory=True)
-        svmr_gt_ed_probs_t = torch.zeros((n_total_query, ctx_len), dtype=torch.float32, device="cpu", pin_memory=True)
+        svmr_gt_st_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
+        svmr_gt_ed_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
     else:
-        svmr_video2meta_idx, svmr_gt_st_probs_t, svmr_gt_ed_probs_t = None, None, None
+        svmr_video2meta_idx, svmr_gt_st_probs, svmr_gt_ed_probs = None, None, None
 
-    # ---- 其它状态 ----
     query_metas = []
-    offset = 0  # 已写入样本计数
-    copy_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    mask_cache = {}  # {L: torch.BoolTensor on device}
-
-    # ---- 主循环 ----
-    for bi, batch in tqdm(enumerate(query_eval_loader), desc="Computing q embedding", total=len(query_eval_loader)):
+    for idx, batch in tqdm(enumerate(query_eval_loader), desc="Computing q embedding", total=len(query_eval_loader)):
         _query_metas = batch[0]
-        query_metas.extend(_query_metas)
-        model_inputs = prepare_batch_inputs(batch[1], device=device, non_blocking=opt.pin_memory)
+        query_metas.extend(batch[0])
+        model_inputs = prepare_batch_inputs(batch[1], device=opt.device, non_blocking=opt.pin_memory)
+        # query_context_scores (_N_q, N_videos), st_prob, ed_prob (_N_q, N_videos, L)
+        _query_context_scores, _st_probs, _ed_probs = model.get_pred_from_raw_query(
+            model_inputs["query_feat"], model_inputs["query_mask"], ctx_info["video_feat"], ctx_info["video_mask"],
+            ctx_info["sub_feat"], ctx_info["sub_mask"], cross=True)
+        # _query_context_scores = _query_context_scores + 1  # move cosine similarity to [0, 2]
+        # To give more importance to top scores, the higher opt.alpha is the more importance will be given
+        _query_context_scores = torch.exp(opt.q2c_alpha * _query_context_scores)
+        # normalize to get true probabilities!!!
+        # the probabilities here are already (pad) masked, so only need to do softmax
+        _st_probs = F.softmax(_st_probs, dim=-1)  # (_N_q, N_videos, L)
+        _ed_probs = F.softmax(_ed_probs, dim=-1)
 
-        # 前向：(_N_q, N_videos), (_N_q, N_videos, L), (_N_q, N_videos, L)
-        with torch.cuda.amp.autocast(device_type="cuda", enabled=use_amp):
-            _q2c, _st_logits, _ed_logits = model.get_pred_from_raw_query(
-                model_inputs["query_feat"], model_inputs["query_mask"],
-                ctx_info["video_feat"], ctx_info["video_mask"],
-                ctx_info["sub_feat"],  ctx_info["sub_mask"],
-                cross=True
-            )
+        if is_svmr:  # collect SVMR data
+            row_indices = torch.arange(0, len(_st_probs))
+            query2video_meta_indices = torch.tensor([svmr_video2meta_idx[e["vid_name"]] for e in _query_metas],
+                                                    dtype=torch.long)
+            svmr_gt_st_probs[idx * bsz:(idx + 1) * bsz, :_st_probs.shape[2]] = \
+                _st_probs[row_indices, query2video_meta_indices].cpu().numpy()
+            svmr_gt_ed_probs[idx * bsz:(idx + 1) * bsz, :_ed_probs.shape[2]] = \
+                _ed_probs[row_indices, query2video_meta_indices].cpu().numpy()
 
-            # 概率（时间维 softmax；logits 已带 pad mask）
-            _st_probs = F.softmax(_st_logits, dim=-1)
-            _ed_probs = F.softmax(_ed_logits, dim=-1)
-
-        B, Nv, L = _st_probs.shape
-
-        # ---------- SVMR：收集 GT 视频的一行 ----------
-        if is_svmr:
-            gt_meta_idx = torch.as_tensor(
-                [svmr_video2meta_idx[e["vid_name"]] for e in _query_metas],
-                dtype=torch.long, device=_st_probs.device
-            )  # (B,)
-            idx3 = gt_meta_idx.view(B, 1, 1).expand(-1, 1, L)        # (B,1,L)
-            st_sel = _st_probs.gather(1, idx3).squeeze(1).contiguous()  # (B,L)
-            ed_sel = _ed_probs.gather(1, idx3).squeeze(1).contiguous()  # (B,L)
-
-            if device.type == "cuda":
-                cur_stream = torch.cuda.current_stream(device=device)
-                copy_stream.wait_stream(cur_stream)
-                with torch.cuda.stream(copy_stream):
-                    svmr_gt_st_probs_t.narrow(0, offset, B).narrow(1, 0, L).copy_(st_sel, non_blocking=True)
-                    svmr_gt_ed_probs_t.narrow(0, offset, B).narrow(1, 0, L).copy_(ed_sel, non_blocking=True)
-            else:
-                svmr_gt_st_probs_t.narrow(0, offset, B).narrow(1, 0, L).copy_(st_sel)
-                svmr_gt_ed_probs_t.narrow(0, offset, B).narrow(1, 0, L).copy_(ed_sel)
-
-        # 若不需要 VR/VCMR，跳过后续
         if not (is_vr or is_vcmr):
-            offset += B
-            if getattr(opt, "debug", False): break
             continue
 
-        # ---------- VR/VCMR：先 topk 再对 topk 做 exp ----------
-        # 与原实现等价：原先是 exp(alpha*s) 后 topk；这里用 scaled=alpha*s 先 topk，再对 topk exp
-        scaled = opt.q2c_alpha * _q2c  # (B, Nv)
+        # Get top-max_n_videos videos for each query
         if external_query2video is None:
-            _topk_scaled, _topk_idx = torch.topk(scaled, max_n_videos, dim=1, largest=True)  # (B, K)
-            _topk_scores = torch.exp(_topk_scaled)  # 等价于对原实现的 top-k 值做 exp
+            _sorted_q2c_scores, _sorted_q2c_indices = torch.topk(_query_context_scores, max_n_videos, dim=1,
+                                                                 largest=True)
         else:
-            # 兼容外部提供的候选（通常在 CPU 列表上）
             relevant_video_info = [external_query2video[qm["desc_id"]] for qm in _query_metas]
-            _topk_idx = torch.as_tensor(
-                [[video_idx2meta_idx[sub_e[0]] for sub_e in e] for e in relevant_video_info],
-                dtype=torch.long, device=scaled.device
-            )
-            raw_scores = torch.as_tensor(
-                [[sub_e[3] for sub_e in e] for e in relevant_video_info],
-                dtype=scaled.dtype, device=scaled.device
-            )
-            _topk_scores = torch.exp(opt.q2c_alpha * raw_scores)  # (B, K)
+            _sorted_q2c_indices = _query_context_scores.new_tensor([[video_idx2meta_idx[sub_e[0]] for sub_e in e] for e in relevant_video_info], dtype=torch.long)
+            _sorted_q2c_scores = _query_context_scores.new_tensor([[sub_e[3] for sub_e in e] for e in relevant_video_info])
+            _sorted_q2c_scores = torch.exp(opt.q2c_alpha * _sorted_q2c_scores)
+        # collect data for vr and backup_vcmr
+        sorted_q2c_indices[idx * bsz:(idx + 1) * bsz] = _sorted_q2c_indices.cpu().numpy()
+        sorted_q2c_scores[idx * bsz:(idx + 1) * bsz] = _sorted_q2c_scores.cpu().numpy()
 
-        K = _topk_idx.size(1)
-
-        # 拷贝 topk 的索引/分数（异步 D2H）
-        if device.type == "cuda":
-            cur_stream = torch.cuda.current_stream(device=device)
-            copy_stream.wait_stream(cur_stream)
-            with torch.cuda.stream(copy_stream):
-                sorted_q2c_indices_t.narrow(0, offset, B).narrow(1, 0, K).copy_(_topk_idx.to("cpu", non_blocking=True), non_blocking=True)
-                sorted_q2c_scores_t.narrow(0, offset, B).narrow(1, 0, K).copy_(_topk_scores.to("cpu", non_blocking=True), non_blocking=True)
-        else:
-            sorted_q2c_indices_t.narrow(0, offset, B).narrow(1, 0, K).copy_(_topk_idx.cpu())
-            sorted_q2c_scores_t.narrow(0, offset, B).narrow(1, 0, K).copy_(_topk_scores.cpu())
-
-        # ---------- VCMR：只对 top-k 视频计算组合得分 ----------
-        if is_vcmr:
-            # 选出 top-k 上的 (B,K,L) 概率：用 gather 避免高级索引
-            idx3k = _topk_idx.view(B, K, 1).expand(-1, -1, L)         # (B,K,L)
-            st_topk = _st_probs.gather(1, idx3k)                      # (B,K,L)
-            ed_topk = _ed_probs.gather(1, idx3k)                      # (B,K,L)
-
-            # 组合：st * q2c * ed -> (B,K,L,L)
-            _st_ed_scores = torch.einsum("bkl,bk,bkn->bkln", st_topk, _topk_scores, ed_topk)
-
-            # 有效起止长度掩码（缓存按 L）
-            if L not in mask_cache:
-                valid_mask_np = generate_min_max_length_mask(_st_ed_scores.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
-                mask_cache[L] = torch.from_numpy(valid_mask_np).to(_st_ed_scores.device, non_blocking=True)
-            _st_ed_scores *= mask_cache[L]
-
-            # 展平排序，取前 max_before_nms
-            _flat = _st_ed_scores.reshape(B, -1)  # (B, K*L*L)
-            _vals, _inds = torch.sort(_flat, dim=1, descending=True)
-            _vals = _vals[:, :max_before_nms].contiguous()
-            _inds = _inds[:, :max_before_nms].contiguous()
-
-            # 异步拷贝
-            if device.type == "cuda":
-                cur_stream = torch.cuda.current_stream(device=device)
-                copy_stream.wait_stream(cur_stream)
-                with torch.cuda.stream(copy_stream):
-                    flat_st_ed_sorted_scores_t.narrow(0, offset, B).copy_(_vals, non_blocking=True)
-                    flat_st_ed_scores_sorted_indices_t.narrow(0, offset, B).copy_(_inds, non_blocking=True)
-            else:
-                flat_st_ed_sorted_scores_t.narrow(0, offset, B).copy_(_vals)
-                flat_st_ed_scores_sorted_indices_t.narrow(0, offset, B).copy_(_inds)
-
-        offset += B
-        if getattr(opt, "debug", False):
+        if not is_vcmr:
+            continue
+        # Get VCMR results
+        # compute combined scores
+        row_indices = torch.arange(0, len(_st_probs), device=opt.device).unsqueeze(1)
+        _st_probs = _st_probs[row_indices, _sorted_q2c_indices]  # (_N_q, max_n_videos, L)
+        _ed_probs = _ed_probs[row_indices, _sorted_q2c_indices]
+        # (_N_q, max_n_videos, L, L)
+        _st_ed_scores = torch.einsum("qvm,qv,qvn->qvmn", _st_probs, _sorted_q2c_scores, _ed_probs)
+        valid_prob_mask = generate_min_max_length_mask(_st_ed_scores.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
+        _st_ed_scores *= torch.from_numpy(valid_prob_mask).to(_st_ed_scores.device)  # invalid location will become zero
+        # sort across the top-max_n_videos videos (by flatten from the 2nd dim)
+        # the indices here are local indices, not global indices
+        _n_q = _st_ed_scores.shape[0]
+        _flat_st_ed_scores = _st_ed_scores.reshape(_n_q, -1)  # (N_q, max_n_videos*L*L)
+        _flat_st_ed_sorted_scores, _flat_st_ed_scores_sorted_indices = torch.sort(_flat_st_ed_scores, dim=1,
+                                                                                  descending=True)
+        # collect data
+        flat_st_ed_sorted_scores[idx * bsz:(idx + 1)*bsz] = _flat_st_ed_sorted_scores[:, :max_before_nms].cpu().numpy()
+        flat_st_ed_scores_sorted_indices[idx * bsz:(idx + 1) * bsz] = \
+            _flat_st_ed_scores_sorted_indices[:, :max_before_nms].cpu().numpy()
+        if opt.debug:
             break
 
-    # ---- 等待所有异步拷贝完成，再 numpy ----
-    if device.type == "cuda":
-        copy_stream.synchronize()
-
-    if is_svmr:
-        svmr_gt_st_probs = svmr_gt_st_probs_t.numpy()
-        svmr_gt_ed_probs = svmr_gt_ed_probs_t.numpy()
-    else:
-        svmr_gt_st_probs = svmr_gt_ed_probs = None
-
-    if is_vr or is_vcmr:
-        sorted_q2c_indices = sorted_q2c_indices_t.numpy()
-        sorted_q2c_scores  = sorted_q2c_scores_t.numpy()
-    else:
-        sorted_q2c_indices = sorted_q2c_scores = None
-
-    if is_vcmr:
-        flat_st_ed_scores_sorted_indices = flat_st_ed_scores_sorted_indices_t.numpy()
-        flat_st_ed_sorted_scores = flat_st_ed_sorted_scores_t.numpy()
-    else:
-        flat_st_ed_scores_sorted_indices = flat_st_ed_sorted_scores = None
-
-    # ---- 组装 SVMR 结果 ----
     svmr_res = []
     if is_svmr:
-        svmr_res = get_svmr_res_from_st_ed_probs(
-            svmr_gt_st_probs, svmr_gt_ed_probs, query_metas, video2idx,
-            clip_length=opt.clip_length, min_pred_l=opt.min_pred_l,
-            max_pred_l=opt.max_pred_l, max_before_nms=max_before_nms
-        )
-
-    # ---- 组装 VR 结果 ----
+        svmr_res = get_svmr_res_from_st_ed_probs(svmr_gt_st_probs, svmr_gt_ed_probs, query_metas, video2idx,
+                                                 clip_length=opt.clip_length, min_pred_l=opt.min_pred_l,
+                                                 max_pred_l=opt.max_pred_l, max_before_nms=max_before_nms)
     vr_res = []
     if is_vr:
-        for i, (_scores_row, _indices_row) in tqdm(
-            enumerate(zip(sorted_q2c_scores[:, :100], sorted_q2c_indices[:, :100])),
-            desc="[VR] Loop over queries to generate predictions", total=n_total_query
-        ):
-            cur_vr_predictions = []
-            for v_score, v_meta_idx in zip(_scores_row, _indices_row):
-                video_idx = video2idx[video_metas[int(v_meta_idx)]["vid_name"]]
-                cur_vr_predictions.append([video_idx, 0, 0, float(v_score)])
+        for i, (_sorted_q2c_scores_row, _sorted_q2c_indices_row) in tqdm(
+                enumerate(zip(sorted_q2c_scores[:, :100], sorted_q2c_indices[:, :100])),
+                desc="[VR] Loop over queries to generate predictions", total=n_total_query):
+            cur_vr_redictions = []
+            for j, (v_score, v_meta_idx) in enumerate(zip(_sorted_q2c_scores_row, _sorted_q2c_indices_row)):
+                video_idx = video2idx[video_metas[v_meta_idx]["vid_name"]]
+                cur_vr_redictions.append([video_idx, 0, 0, float(v_score)])
             cur_query_pred = dict(desc_id=query_metas[i]['desc_id'], desc=query_metas[i]["desc"],
-                                  predictions=cur_vr_predictions)
+                                  predictions=cur_vr_redictions)
             vr_res.append(cur_query_pred)
 
-    # ---- 组装 VCMR 结果 ----
     vcmr_res = []
     if is_vcmr:
-        for i, (_inds_row, _vals_row) in tqdm(
-            enumerate(zip(flat_st_ed_scores_sorted_indices, flat_st_ed_sorted_scores)),
-            desc="[VCMR] Loop over queries to generate predictions", total=n_total_query
-        ):
-            # indices 是在 (K, L, L) 展平后的局部索引
+        for i, (_flat_st_ed_scores_sorted_indices, _flat_st_ed_sorted_scores) in tqdm(
+                enumerate(zip(flat_st_ed_scores_sorted_indices, flat_st_ed_sorted_scores)),
+                desc="[VCMR] Loop over queries to generate predictions", total=n_total_query):  # i is query_idx
+            # list([video_idx(int), st(float), ed(float), score(float)])
             video_meta_indices_local, pred_st_indices, pred_ed_indices = np.unravel_index(
-                _inds_row, shape=(max_n_videos, ctx_len, ctx_len)
-            )
-            # 本地 top-k -> 全局 meta idx
+                _flat_st_ed_scores_sorted_indices, shape=(max_n_videos, opt.max_ctx_l, opt.max_ctx_l))
+            # video_meta_indices_local refers to the indices among the top-max_n_videos
+            # video_meta_indices refers to the indices in all the videos, which is the True indices
             video_meta_indices = sorted_q2c_indices[i, video_meta_indices_local]
             pred_st_in_seconds = pred_st_indices.astype(np.float32) * opt.clip_length
-            pred_ed_in_seconds = pred_ed_indices.astype(np.float32) * opt.clip_length
-
-            cur_vcmr_predictions = []
-            for j, (v_meta_idx, v_score) in enumerate(zip(video_meta_indices, _vals_row)):
-                video_idx = video2idx[video_metas[int(v_meta_idx)]["vid_name"]]
-                cur_vcmr_predictions.append([video_idx, float(pred_st_in_seconds[j]), float(pred_ed_in_seconds[j]), float(v_score)])
-
+            pred_ed_in_seconds = pred_ed_indices.astype(np.float32) * opt.clip_length  # + opt.clip_length
+            cur_vcmr_redictions = []
+            for j, (v_meta_idx, v_score) in enumerate(zip(video_meta_indices, _flat_st_ed_sorted_scores)):  # videos
+                video_idx = video2idx[video_metas[v_meta_idx]["vid_name"]]
+                cur_vcmr_redictions.append([video_idx, float(pred_st_in_seconds[j]), float(pred_ed_in_seconds[j]),
+                                            float(v_score)])
             cur_query_pred = dict(desc_id=query_metas[i]["desc_id"], desc=query_metas[i]["desc"],
-                                  predictions=cur_vcmr_predictions)
+                                  predictions=cur_vcmr_redictions)
             vcmr_res.append(cur_query_pred)
 
     res = dict(SVMR=svmr_res, VCMR=vcmr_res, VR=vr_res)

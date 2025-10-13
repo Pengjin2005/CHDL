@@ -342,6 +342,8 @@ class HashedVector:
     code: torch.Tensor
     bin_like: torch.Tensor
     x_origin: torch.Tensor
+    bits01: torch.Tensor = None        # (B, Dh) uint8 in {0,1}
+    packed_bits: torch.Tensor = None   # (B, ceil(Dh/8)) uint8
 
 class HashLayer(nn.Module):
     def __init__(self, input_output_size, hidden_size):
@@ -357,18 +359,75 @@ class HashLayer(nn.Module):
         nn.ReLU(inplace=True),
         nn.Linear(1024, input_output_size),
         )
-        # 4096        
+        # 4096     
+
+        lut = torch.tensor([int(bin(i).count("1")) for i in range(256)], dtype=torch.uint8)
+        self.register_buffer("_pop_lut_256", lut, persistent=False)
+
+    @staticmethod
+    def _pack_bits(bits01: torch.Tensor) -> torch.Tensor:
+        """
+        bits01: (B, D) uint8 in {0,1}  ->  packed: (B, ceil(D/8)) uint8
+        """
+        B, D = bits01.shape
+        pad = (-D) % 8
+        if pad:
+            bits01 = F.pad(bits01, (0, pad), value=0)
+            D += pad
+        bits01 = bits01.view(B, D // 8, 8)                        # (B, nbytes, 8)
+        # 权重 [1,2,4,8,16,32,64,128]
+        weights = (1 << torch.arange(8, device=bits01.device, dtype=torch.uint8))
+        packed = (bits01 * weights).sum(dim=-1).to(torch.uint8)   # (B, nbytes)
+        return packed
+
+    @torch.no_grad()
+    def export_bits(self, x: torch.Tensor, eta: float = 1.0, pack: bool = True):
+        """
+        仅推理使用：编码 -> sign -> {0,1} -> (可选)pack 成字节
+        返回 (bits01, packed)；train/eval 无关
+        """
+        code = self.encoder(x)
+        code = F.normalize(code, dim=1, eps=1e-6)
+        bits01 = (code >= 0).to(torch.uint8)   # (B, Dh) 0/1
+        if pack:
+            packed = self._pack_bits(bits01)
+            return bits01, packed
+        else:
+            return bits01, None
     
-    def forward(self, x, eta=1.0):
+    def forward(self, x, eta=1.0, eval_skip_decoder = True, export_packed = False):
         self.x = x
         code = self.encoder(x)            # (B, hidden_size)
         code = F.normalize(code, dim=1, eps=1e-6)
         # Clamp eta*code to prevent extreme values in tanh
-        scaled_code = torch.clamp(eta * code, min=-10.0, max=10.0)
-        bin_like = torch.tanh(scaled_code) if self.training else torch.sign(code)
-        recon = self.decoder(bin_like)    # (B, input_output_size)
-        return HashedVector(recon, code, bin_like, x)
+        if self.training:
+            scaled_code = torch.clamp(eta * code, min=-10.0, max=10.0)
+            bin_like = torch.tanh(scaled_code) if self.training else torch.sign(code)
+            recon = self.decoder(bin_like)    # (B, input_output_size)
+            return HashedVector(recon, code, bin_like, x)
+        else:
+            bin_like = torch.sign(code)
+            recon = x
+            if export_packed:
+                bits01 = (bin_like  > 0).to(torch.uint8)   # (B, Dh) 0/1
+                packed = self._pack_bits(bits01)
+                return HashedVector(recon, code, bin_like, x, bits01=bits01, packed_bits=packed)
+            else:
+                return HashedVector(recon, code, bin_like, x)
     
+    def xnor_popcount(self, A_packed: torch.Tensor, B_packed: torch.Tensor) -> torch.Tensor:
+        """
+        A_packed: (N, nbytes) uint8
+        B_packed: (M, nbytes) uint8
+        返回 matches: (N, M)  —— 每对向量的“匹配位数”（XNOR 后的 1 的数量）
+        """
+        # 扩维做两两比较：XNOR = ~(A ^ B)
+        xnor = torch.bitwise_not(A_packed.unsqueeze(1) ^ B_packed.unsqueeze(0))  # (N, M, nbytes) uint8
+        # LUT popcount：把每个字节映射到 [0..8] 再求和
+        matches_per_byte = self._pop_lut_256[xnor]                               # (N, M, nbytes) uint8
+        matches = matches_per_byte.to(torch.int32).sum(dim=-1)                   # (N, M) int32
+        return matches
+
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
         # Numerically stable version: log(cosh(x)) = |x| + log(1 + exp(-2|x|))
@@ -829,45 +888,56 @@ class ConditionalEndGivenStart(nn.Module):
     def forward(self, Hq, anchor_idx, mask=None):
         N, L, D = Hq.size()
         device = Hq.device
+        dtype  = Hq.dtype
 
-        # (1) 锚点向量 & 初始状态
-        a = Hq[torch.arange(N, device=device), anchor_idx]      # (N, D)
-        h0, c0 = self.init_end(a).chunk(2, dim=-1)              # (N, H), (N, H)
-        h0 = h0.unsqueeze(0).contiguous()                       # (1, N, H)
-        c0 = c0.unsqueeze(0).contiguous()                       # (1, N, H)
+        # (0) indices must be long
+        anchor_idx = anchor_idx.long()
 
-        # (2) 计算每样本尾段长度 & 最大长度
-        lengths = (L - anchor_idx).clamp_min(0)                 # (N,)
+        # (1) anchor vector & initial state
+        a = Hq[torch.arange(N, device=device), anchor_idx]          # (N, D)
+        h0, c0 = self.init_end(a).chunk(2, dim=-1)                  # (N, H), (N, H)
+        h0 = h0.unsqueeze(0).contiguous()                           # (1, N, H)
+        c0 = c0.unsqueeze(0).contiguous()                           # (1, N, H)
+
+        # (2) tail lengths
+        lengths = (L - anchor_idx).clamp_min(0)                     # (N,)
         T_max = int(lengths.max().item())
 
-        # 如果所有样本 anchor 都在末帧，直接返回 0（外层会处理 -inf/掩码）
-        Se = Hq.new_zeros(N, L)
+        # output buffer with same dtype/device as Hq
+        Se = Hq.new_zeros(N, L)                                     # (N, L)
+
         if T_max == 0:
-            return Se
+            return Se  # all anchors at last frame
 
-        # (3) 一次性索引尾段帧：idx_time[b, t] = anchor_idx[b] + t
-        t = torch.arange(T_max, device=device).unsqueeze(0)      # (1, T_max)
-        idx_time = anchor_idx.unsqueeze(1) + t                   # (N, T_max)
-        valid = idx_time < L                                     # (N, T_max)
-        idx_time = idx_time.clamp(max=L-1)
+        # (3) tail time indices
+        t = torch.arange(T_max, device=device, dtype=anchor_idx.dtype).unsqueeze(0)  # (1, T_max)
+        idx_time = anchor_idx.unsqueeze(1) + t                                       # (N, T_max)
+        valid = idx_time < L                                                         # (N, T_max)
+        idx_time = idx_time.clamp(max=L-1)                                          # keep in range for gather
 
-        # gather 出 tails: (N, T_max, D)
-        tails = Hq.gather(1, idx_time.unsqueeze(-1).expand(-1, -1, D))
-        a_ctx = a.unsqueeze(1).expand(N, T_max, D)               # (N, T_max, D)
-        x = torch.cat([tails, a_ctx], dim=-1)                    # (N, T_max, 2D)
+        # (4) gather tails and build inputs
+        tails = Hq.gather(1, idx_time.unsqueeze(-1).expand(-1, -1, D))               # (N, T_max, D)
+        a_ctx = a.unsqueeze(1).expand(N, T_max, D)                                   # (N, T_max, D)
+        x = torch.cat([tails, a_ctx], dim=-1)                                        # (N, T_max, 2D)
 
-        # (4) 可变长度打包 -> LSTM
-        packed = pack_padded_sequence(x, lengths=lengths.cpu(), batch_first=True, enforce_sorted=False)
+        # (5) pack with nonzero lengths for safety (older PyTorch)
+        lengths_for_pack = torch.where(lengths == 0, torch.ones_like(lengths), lengths)
+        packed = pack_padded_sequence(x, lengths=lengths_for_pack.cpu(),
+                                    batch_first=True, enforce_sorted=False)
         packed_h, _ = self.lstm_end(packed, (h0, c0))
-        h, _ = pad_packed_sequence(packed_h, batch_first=True, total_length=T_max)  # (N, T_max, H)
+        h, _ = pad_packed_sequence(packed_h, batch_first=True, total_length=T_max)   # (N, T_max, H)
 
-        # (5) 逐步映射到 logits（仅在有效位置）
-        logits_tail = self.fc_end(torch.cat([h, tails], dim=-1)).squeeze(-1)  # (N, T_max)
+        # (6) logits on tail
+        logits_tail = self.fc_end(torch.cat([h, tails], dim=-1)).squeeze(-1)         # (N, T_max)
 
-        # (6) scatter 回原长 Se（只写 valid 位置）
-        bidx = torch.arange(N, device=device).unsqueeze(1).expand_as(idx_time)      # (N, T_max)
-        Se.index_put_((bidx[valid], idx_time[valid]), logits_tail[valid])
+        # (7) scatter back only at valid positions
+        bidx = torch.arange(N, device=device, dtype=idx_time.dtype).unsqueeze(1).expand_as(idx_time)  # (N, T_max)
+
+        # Ensure dtype match on write; advanced-index assignment is clearer than index_put_
+        Se[bidx[valid].long(), idx_time[valid].long()] = logits_tail[valid].to(Se.dtype)
+
         return Se
+
 
 
 # ---------------------------
