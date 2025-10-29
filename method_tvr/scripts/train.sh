@@ -14,6 +14,8 @@ feature_root=data/TVR
 results_root=method_tvr/results
 vid_feat_size=2048
 extra_args=()
+n_video=100
+
 
 lr=1e-4 #1e-4
 batch_size=128 # 128
@@ -23,7 +25,9 @@ lw_neg_ctx=1.0
 lw_st_ed=0.1
 
 lw_fcl=0.1 # 0.03
+# lw_fcl=0.0
 lw_vcl=0.3 # 0.1
+# lw_vcl=0.0
 
 lw_rec=1.0
 lw_q=1e-2
@@ -207,5 +211,6 @@ python method_tvr/train.py \
 --clip_length=${clip_length} \
 --vid_feat_size=${vid_feat_size} \
 --ctx_mode=${ctx_mode} \
+--max_vcmr_video=${n_video} \
 ${extra_args[@]} \
 ${@:4}

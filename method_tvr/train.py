@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from method_tvr.config import BaseOptions
 from method_tvr.model import ReLoCLNet
-from method_tvr.start_end_dataset import StartEndDataset, start_end_collate, StartEndEvalDataset, prepare_batch_inputs
+from method_tvr.start_end_verified_dataset import StartEndDataset, start_end_collate, StartEndEvalDataset, prepare_batch_inputs
 from method_tvr.inference import eval_epoch, start_inference
 from method_tvr.optimization import BertAdam
 from utils.basic_utils import AverageMeter

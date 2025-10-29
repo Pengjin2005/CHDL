@@ -85,75 +85,39 @@ TASK_TYPES = OrderedDict([
     ("VR", "regular Video Retrieval")
 ])
 
-
 def eval_by_task_type(moment_predictions, video2idx, ground_truth,
                      iou_thds=(0.5, 0.7), recall_topks=(1, 5, 10, 100),
                      task_type="SVMR", max_pred_per_query=100, match_number=True, verbose=True, use_desc_type=True):
-    """ a predicted triplet is positive only if:
-    1) its vid_name matches the GT vid_name
-    2) IoU between its timestamp and GT timestamp is higher than the given threshold
-
-    moment_predictions w.r.t. different task_type:
-        For each query, evaluated on top max_pred_per_query [vid_name, st, ed] triplets. (score entry ignored)
-        VCMR: vid_name might be repeating.
-        SVMR: vid_name is fixed to be the GT vid_name.
-        VR: vid_name is not repeating, st and ed will not be used.
-
-    Args:
-        video2idx: {vid_name (str): index (int), ...}
-        moment_predictions: list(dict), each dict is {
-            "desc": str,
-            "desc_id": int,
-            "predictions": [vid_name_idx (int), st (float), ed (float), score (float)] * n_pred,
-                sorted predictions, n_pred could be different for all dicts. For each prediction,
-                only the first 3 elements [vid_name (str), st (float), ed (float),] are used,
-                any other following elements are ignored. We leave score here for record.
-        }
-        ground_truth: list(dict), each dict is {
-            "desc": str,
-            "desc_id": int,
-            "type": str, one of [v, t, vt]
-            "vid_name": str
-            "ts": [st (float), ed (float)], or list([st (float), ed (float)]), len == 4.
-            ...
-        }
-        iou_thds: temporal IoU thresholds
-        recall_topks: recall at different top k
-        task_type: str, could be: ["VCMR", "SVMR", "VR"], see TASK_TYPES for definition.
-        max_pred_per_query: int, only top max_pred_per_query predictions for each query are used.
-        match_number: bool, must set to True if when do evaluation, False is only used for debug.
-        verbose:
-        use_desc_type: only TVR has desc type
-    Returns:
-
-    """
+    """Robust evaluation across VCMR/SVMR/VR. If GT has no desc-type, _by_type metrics are disabled."""
     assert task_type in TASK_TYPES, "task_type must be one of {}".format(list(TASK_TYPES.keys()))
     if verbose:
-        print("Running evaluation with task_type {}, n results {}; n gt {}"
-              .format(task_type, len(moment_predictions), len(ground_truth)))
+        print("Running evaluation with task_type {}, n results {}; n gt {}".format(
+            task_type, len(moment_predictions), len(ground_truth))
+        )
 
     predictions_by_desc_id = {e["desc_id"]: e for e in moment_predictions}
     gt_by_desc_id = {e["desc_id"]: e for e in ground_truth}
-    # 取一个样本看有哪些键
+
+    # Probe a sample GT item to find key names
     _sample = next(iter(gt_by_desc_id.values()))
     vidname_key = _pick_key(_sample, ["vid_name", "vid", "video", "video_id"])
     ts_key      = _pick_key(_sample, ["ts", "timestamps", "timestamp", "time", "timespan", "span"])
+    # NEW: find a usable type key, if any
+    type_key    = _pick_key(_sample, ["type", "desc_type", "descType", "query_type"])
 
     if vidname_key is None:
         raise KeyError("GT items do not have a recognizable video-name key (tried vid_name/vid/video/video_id).")
     if ts_key is None:
         raise KeyError("GT items do not have a recognizable timestamp key (tried ts/timestamps/timestamp/time/timespan/span).")
 
-
-
+    # Only compute by-type metrics if caller wants it AND a type key is present
+    local_use_desc_type = bool(use_desc_type and type_key is not None)
     desc_type2idx = {"v": 0, "t": 1, "vt": 2}
-    desc_types = []  # n_desc
+    desc_types = []  # will be filled only if local_use_desc_type stays True
 
     if match_number:
         assert set(gt_by_desc_id.keys()) == set(predictions_by_desc_id.keys()), \
             "desc_ids in predictions and ground_truth must match"
-    # assert len(set([len(e["predictions"]) for e in predictions_by_desc_id.values()])) == 1, \
-    #     "all queries must have the same number of predictions"
 
     pred_info_matrix_collection = []
     for k, gt_item in tqdm(gt_by_desc_id.items(), desc="Loop over moments", leave=False):
@@ -162,112 +126,118 @@ def eval_by_task_type(moment_predictions, video2idx, ground_truth,
         pred_info_matrix = np.array(
             [e[:3] for e in predictions_by_desc_id[k]["predictions"]][:max_pred_per_query],
             dtype=np.float32)  # (n_pred, 3)
-        if use_desc_type:
-            desc_types.append(desc_type2idx[gt_item["type"]])
-        vid_name_matched_pred = pred_info_matrix[:, 0] == video2idx[gt_item[vidname_key]]
 
+        # Try to record desc type; if missing or unrecognized, disable by-type metrics
+        if local_use_desc_type:
+            tval = str(gt_item.get(type_key, "")).lower()
+            if tval in desc_type2idx:
+                desc_types.append(desc_type2idx[tval])
+            else:
+                if verbose:
+                    print("No valid desc-type found in GT (value: {!r}); disabling by-type metrics.".format(tval))
+                local_use_desc_type = False  # turn off for the rest of the run
+                desc_types = []  # discard partials
+
+        vid_name_matched_pred = pred_info_matrix[:, 0] == video2idx[gt_item[vidname_key]]
         pred_info_matrix = np.concatenate([pred_info_matrix, vid_name_matched_pred[:, None]], axis=1)  # (n_pred, 4)
 
-        # add 1 + len(iou_thds) columns, iou_scores, iou_corrects for each iou_thd.
+        # add 1 + len(iou_thds) columns, iou_corrects for each iou_thd.
         iou_thd_corrects_columns = []
-        if len(gt_item[ts_key]) >= 4:  # didemo, fro all 3 splits, at least 4 ts for each, < 0.5% has more than 4.
-            least_n_overlap = 2  # True if overlapped with at least least_n_overlap GT ts.
+        if len(gt_item[ts_key]) >= 4:  # multiple GT spans
+            least_n_overlap = 2
             iou_corrects_dict = defaultdict(list)
             for single_gt_ts in gt_item[ts_key]:
-                single_gt_ts = np.array(single_gt_ts, dtype=np.float32)  # (2, )
-                # iou scores of the predictions that have wrong vid_name are set to 0.
+                single_gt_ts = np.array(single_gt_ts, dtype=np.float32)
                 iou_scores = compute_temporal_iou_batch(pred_info_matrix[:, 1:3], single_gt_ts) * vid_name_matched_pred
                 for iou_thd in iou_thds:
                     iou_corrects_dict[iou_thd].append(iou_scores >= iou_thd)
             for iou_thd in iou_thds:
-                iou_corrects = sum(iou_corrects_dict[iou_thd]) >= least_n_overlap  # bool, (n_pred, )
+                iou_corrects = sum(iou_corrects_dict[iou_thd]) >= least_n_overlap
                 iou_thd_corrects_columns.append(iou_corrects[:, None])
-
-        else:  # should be 2, len([st, ed]) == 2
-            single_gt_ts = np.array(gt_item[ts_key], dtype=np.float32)  # (2, )
-            # iou scores of the predictions that have wrong vid_name are set to 0.
+        else:  # single GT span
+            single_gt_ts = np.array(gt_item[ts_key], dtype=np.float32)
             iou_scores = compute_temporal_iou_batch(pred_info_matrix[:, 1:3], single_gt_ts) * vid_name_matched_pred
-
             for iou_thd in iou_thds:
-                iou_corrects = iou_scores >= iou_thd  # bool, (n_pred, )
+                iou_corrects = iou_scores >= iou_thd
                 iou_thd_corrects_columns.append(iou_corrects[:, None])
 
-        pred_info_matrix = np.concatenate([pred_info_matrix, ] + iou_thd_corrects_columns, axis=1)  # (n_pred, 6)
+        pred_info_matrix = np.concatenate([pred_info_matrix] + iou_thd_corrects_columns, axis=1)  # (n_pred, 4+len(iou))
         pred_info_matrix_collection.append(pred_info_matrix)
 
-    # column header [vid_name_idx (int), st (float), ed (float), is_vid_name_match (bool),
-    # iou_scores>=iou_thd0 (bool), iou_scores>=iou_thd1 (bool)]
-    pred_info_matrix_collection = pad_sequences_1d_np(pred_info_matrix_collection)[0]  # (n_desc, n_pred, 6)
-    if use_desc_type:
-        desc_types = np.array(desc_types)  # (n_desc)
+    pred_info_matrix_collection = pad_sequences_1d_np(pred_info_matrix_collection)[0]  # (n_desc, n_pred, 4+len(iou))
+    if local_use_desc_type:
+        desc_types = np.array(desc_types)
 
-    # results wrapper
     metrics = OrderedDict()
     metrics_by_type = OrderedDict()
 
     iou_c_offset = 4  # iou_corrects column index starts here
     if task_type == "VCMR":
         for iou_idx, iou_thd in enumerate(iou_thds):
-            iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)  # (n_desc, n_pred)
-            # 1) there might be more than one positive clip, so use `>= 1`
+            iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)
             for k in recall_topks:
-                metrics["{}-r{}".format(iou_thd, k)] = \
-                    get_rounded_percentage(np.mean(np.sum(iou_corrects[:, :k], axis=1) >= 1))
-        if use_desc_type:
-            for desc_type in desc_type2idx:
-                type_corrects = desc_types == desc_type2idx[desc_type]  # (n_desc)
-                n_desc_in_type = np.sum(type_corrects)  # (n_desc)
+                metrics[f"{iou_thd}-r{k}"] = get_rounded_percentage(np.mean(np.sum(iou_corrects[:, :k], axis=1) >= 1))
+        if local_use_desc_type:
+            for desc_type, idx in desc_type2idx.items():
+                type_mask = desc_types == idx
+                n_desc_in_type = np.sum(type_mask)
+                if n_desc_in_type == 0:
+                    continue
                 for iou_idx, iou_thd in enumerate(iou_thds):
-                    # (n_desc, n_pred)
                     iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)
                     for k in recall_topks:
-                        metrics_by_type["{}-{}-r{}".format(desc_type, iou_thd, k)] = get_rounded_percentage(
-                            1.0 * np.sum(np.logical_and(np.sum(iou_corrects[:, :k], axis=1) >= 1, type_corrects))
+                        metrics_by_type[f"{desc_type}-{iou_thd}-r{k}"] = get_rounded_percentage(
+                            1.0 * np.sum(np.logical_and(np.sum(iou_corrects[:, :k], axis=1) >= 1, type_mask))
                             / n_desc_in_type
                         )
     elif task_type == "SVMR":
-        vid_name_matched = pred_info_matrix_collection[:, :, 3].astype(bool)  # (n_desc, n_pred)
+        vid_name_matched = pred_info_matrix_collection[:, :, 3].astype(bool)
         n_desc = len(vid_name_matched)
         for iou_idx, iou_thd in enumerate(iou_thds):
-            iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)  # (n_desc, n_pred)
-            # 1) there might be more than one positive clip, so use `>= 1`
+            iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)
             for k in recall_topks:
-                metrics["{}-r{}".format(iou_thd, k)] = get_rounded_percentage(np.mean(
+                metrics[f"{iou_thd}-r{k}"] = get_rounded_percentage(np.mean(
                     [np.sum(iou_corrects[idx][vid_name_matched[idx]][:k]) >= 1 for idx in range(n_desc)]
                 ))
-        if use_desc_type:
-            for desc_type in desc_type2idx:
-                type_corrects = desc_types == desc_type2idx[desc_type]  # (n_desc)
-                n_desc_in_type = np.sum(type_corrects)  # (n_desc)
+        if local_use_desc_type:
+            for desc_type, idx in desc_type2idx.items():
+                type_mask = desc_types == idx
+                n_desc_in_type = np.sum(type_mask)
+                if n_desc_in_type == 0:
+                    continue
                 for iou_idx, iou_thd in enumerate(iou_thds):
-                    # (n_desc, n_pred)
                     iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)
-                    # 1) there might be more than one positive clip, so use `>= 1`
                     for k in recall_topks:
-                        metrics_by_type["{}-{}-r{}".format(desc_type, iou_thd, k)] = get_rounded_percentage(
-                            1.0 * np.sum([np.sum(iou_corrects[idx][vid_name_matched[idx]][:k]) >= 1 and type_corrects[idx]
-                                         for idx in range(n_desc)])
-                            / n_desc_in_type)
-
+                        metrics_by_type[f"{desc_type}-{iou_thd}-r{k}"] = get_rounded_percentage(
+                            1.0 * np.sum([
+                                np.sum(iou_corrects[d][vid_name_matched[d]][:k]) >= 1 and type_mask[d]
+                                for d in range(n_desc)
+                            ]) / n_desc_in_type
+                        )
     elif task_type == "VR":
-        vid_name_matched = pred_info_matrix_collection[:, :, 3].astype(bool)  # (n_desc, n_pred)
+        vid_name_matched = pred_info_matrix_collection[:, :, 3].astype(bool)
         for k in recall_topks:
-            metrics["r{}".format(k)] = \
-                get_rounded_percentage(np.mean(np.sum(vid_name_matched[:, :k], axis=1) >= 1))
-        if use_desc_type:
-            for desc_type in desc_type2idx:
-                type_corrects = desc_types == desc_type2idx[desc_type]  # (n_desc)
-                n_desc_in_type = np.sum(type_corrects)  # (n_desc)
+            metrics[f"r{k}"] = get_rounded_percentage(np.mean(np.sum(vid_name_matched[:, :k], axis=1) >= 1))
+        if local_use_desc_type:
+            for desc_type, idx in desc_type2idx.items():
+                type_mask = desc_types == idx
+                n_desc_in_type = np.sum(type_mask)
+                if n_desc_in_type == 0:
+                    continue
                 for k in recall_topks:
-                    metrics_by_type["{}-r{}".format(desc_type, k)] = get_rounded_percentage(
-                        1.0 * np.sum(np.logical_and(np.sum(vid_name_matched[:, :k], axis=1) >= 1, type_corrects))
-                        / n_desc_in_type)
+                    metrics_by_type[f"{desc_type}-r{k}"] = get_rounded_percentage(
+                        1.0 * np.sum(np.logical_and(np.sum(vid_name_matched[:, :k], axis=1) >= 1, type_mask))
+                        / n_desc_in_type
+                    )
     else:
         raise ValueError("task_type wrong.")
-    if use_desc_type:
-        metrics_by_type["desc_type_ratio"] = "v {} t {} vt {}"\
-            .format(*[get_rounded_percentage(1.0 * np.sum(desc_types == desc_type2idx[k]) / len(desc_types))
-                      for k in ["v", "t", "vt"]])
+
+    if local_use_desc_type:
+        metrics_by_type["desc_type_ratio"] = "v {} t {} vt {}".format(
+            *[get_rounded_percentage(1.0 * np.sum(desc_types == desc_type2idx[k]) / len(desc_types))
+              for k in ["v", "t", "vt"]]
+        )
+
     return metrics, metrics_by_type
 
 
@@ -276,23 +246,243 @@ def eval_retrieval(submission, ground_truth, iou_thds=(0.5, 0.7), verbose=True, 
     submitted_task_types = [k for k in TASK_TYPES if k in submission]
     if verbose:
         print("Evaluating for task {}".format(submitted_task_types))
+
+    # Auto-disable by-type metrics if GT lacks a usable type key
+    sample_gt = ground_truth[0] if len(ground_truth) > 0 else {}
+    type_key = _pick_key(sample_gt, ["type", "desc_type", "descType", "query_type"])
+    local_use_desc_type = bool(use_desc_type and type_key is not None)
+
     eval_metrics = OrderedDict()
     metrics_raw_dict = {}
+
     for task_type in submitted_task_types:
         metrics, metrics_by_type = eval_by_task_type(
             submission[task_type], video2idx, ground_truth,
-            iou_thds=iou_thds, recall_topks=(1, 10, 100),  # (1, 5, 10, 20, 50, 100),
+            iou_thds=iou_thds, recall_topks=(1, 10, 100),
             task_type=task_type, max_pred_per_query=100,
-            match_number=match_number, verbose=verbose, use_desc_type=use_desc_type)
+            match_number=match_number, verbose=verbose, use_desc_type=local_use_desc_type
+        )
         metrics_raw_dict[task_type] = metrics
-        metrics_raw_dict[task_type+"_by_type"] = metrics_by_type
+        if local_use_desc_type:
+            metrics_raw_dict[task_type + "_by_type"] = metrics_by_type
 
     for task_type in submitted_task_types:
         eval_metrics[task_type] = metrics_raw_dict[task_type]
-    if use_desc_type:
-        for task_type in submitted_task_types:
-            eval_metrics[task_type+"_by_type"] = metrics_raw_dict[task_type+"_by_type"]
+        if local_use_desc_type and (task_type + "_by_type") in metrics_raw_dict:
+            eval_metrics[task_type + "_by_type"] = metrics_raw_dict[task_type + "_by_type"]
+
     return eval_metrics
+
+
+
+
+# def eval_by_task_type(moment_predictions, video2idx, ground_truth,
+#                      iou_thds=(0.5, 0.7), recall_topks=(1, 5, 10, 100),
+#                      task_type="SVMR", max_pred_per_query=100, match_number=True, verbose=True, use_desc_type=True):
+#     """ a predicted triplet is positive only if:
+#     1) its vid_name matches the GT vid_name
+#     2) IoU between its timestamp and GT timestamp is higher than the given threshold
+
+#     moment_predictions w.r.t. different task_type:
+#         For each query, evaluated on top max_pred_per_query [vid_name, st, ed] triplets. (score entry ignored)
+#         VCMR: vid_name might be repeating.
+#         SVMR: vid_name is fixed to be the GT vid_name.
+#         VR: vid_name is not repeating, st and ed will not be used.
+
+#     Args:
+#         video2idx: {vid_name (str): index (int), ...}
+#         moment_predictions: list(dict), each dict is {
+#             "desc": str,
+#             "desc_id": int,
+#             "predictions": [vid_name_idx (int), st (float), ed (float), score (float)] * n_pred,
+#                 sorted predictions, n_pred could be different for all dicts. For each prediction,
+#                 only the first 3 elements [vid_name (str), st (float), ed (float),] are used,
+#                 any other following elements are ignored. We leave score here for record.
+#         }
+#         ground_truth: list(dict), each dict is {
+#             "desc": str,
+#             "desc_id": int,
+#             "type": str, one of [v, t, vt]
+#             "vid_name": str
+#             "ts": [st (float), ed (float)], or list([st (float), ed (float)]), len == 4.
+#             ...
+#         }
+#         iou_thds: temporal IoU thresholds
+#         recall_topks: recall at different top k
+#         task_type: str, could be: ["VCMR", "SVMR", "VR"], see TASK_TYPES for definition.
+#         max_pred_per_query: int, only top max_pred_per_query predictions for each query are used.
+#         match_number: bool, must set to True if when do evaluation, False is only used for debug.
+#         verbose:
+#         use_desc_type: only TVR has desc type
+#     Returns:
+
+#     """
+#     assert task_type in TASK_TYPES, "task_type must be one of {}".format(list(TASK_TYPES.keys()))
+#     if verbose:
+#         print("Running evaluation with task_type {}, n results {}; n gt {}"
+#               .format(task_type, len(moment_predictions), len(ground_truth)))
+
+#     predictions_by_desc_id = {e["desc_id"]: e for e in moment_predictions}
+#     gt_by_desc_id = {e["desc_id"]: e for e in ground_truth}
+#     # 取一个样本看有哪些键
+#     _sample = next(iter(gt_by_desc_id.values()))
+#     vidname_key = _pick_key(_sample, ["vid_name", "vid", "video", "video_id"])
+#     ts_key      = _pick_key(_sample, ["ts", "timestamps", "timestamp", "time", "timespan", "span"])
+
+#     if vidname_key is None:
+#         raise KeyError("GT items do not have a recognizable video-name key (tried vid_name/vid/video/video_id).")
+#     if ts_key is None:
+#         raise KeyError("GT items do not have a recognizable timestamp key (tried ts/timestamps/timestamp/time/timespan/span).")
+
+
+
+#     desc_type2idx = {"v": 0, "t": 1, "vt": 2}
+#     desc_types = []  # n_desc
+
+#     if match_number:
+#         assert set(gt_by_desc_id.keys()) == set(predictions_by_desc_id.keys()), \
+#             "desc_ids in predictions and ground_truth must match"
+#     # assert len(set([len(e["predictions"]) for e in predictions_by_desc_id.values()])) == 1, \
+#     #     "all queries must have the same number of predictions"
+
+#     pred_info_matrix_collection = []
+#     for k, gt_item in tqdm(gt_by_desc_id.items(), desc="Loop over moments", leave=False):
+#         if not match_number and k not in predictions_by_desc_id:
+#             continue
+#         pred_info_matrix = np.array(
+#             [e[:3] for e in predictions_by_desc_id[k]["predictions"]][:max_pred_per_query],
+#             dtype=np.float32)  # (n_pred, 3)
+#         if use_desc_type:
+#             desc_types.append(desc_type2idx[gt_item["type"]])
+#         vid_name_matched_pred = pred_info_matrix[:, 0] == video2idx[gt_item[vidname_key]]
+
+#         pred_info_matrix = np.concatenate([pred_info_matrix, vid_name_matched_pred[:, None]], axis=1)  # (n_pred, 4)
+
+#         # add 1 + len(iou_thds) columns, iou_scores, iou_corrects for each iou_thd.
+#         iou_thd_corrects_columns = []
+#         if len(gt_item[ts_key]) >= 4:  # didemo, fro all 3 splits, at least 4 ts for each, < 0.5% has more than 4.
+#             least_n_overlap = 2  # True if overlapped with at least least_n_overlap GT ts.
+#             iou_corrects_dict = defaultdict(list)
+#             for single_gt_ts in gt_item[ts_key]:
+#                 single_gt_ts = np.array(single_gt_ts, dtype=np.float32)  # (2, )
+#                 # iou scores of the predictions that have wrong vid_name are set to 0.
+#                 iou_scores = compute_temporal_iou_batch(pred_info_matrix[:, 1:3], single_gt_ts) * vid_name_matched_pred
+#                 for iou_thd in iou_thds:
+#                     iou_corrects_dict[iou_thd].append(iou_scores >= iou_thd)
+#             for iou_thd in iou_thds:
+#                 iou_corrects = sum(iou_corrects_dict[iou_thd]) >= least_n_overlap  # bool, (n_pred, )
+#                 iou_thd_corrects_columns.append(iou_corrects[:, None])
+
+#         else:  # should be 2, len([st, ed]) == 2
+#             single_gt_ts = np.array(gt_item[ts_key], dtype=np.float32)  # (2, )
+#             # iou scores of the predictions that have wrong vid_name are set to 0.
+#             iou_scores = compute_temporal_iou_batch(pred_info_matrix[:, 1:3], single_gt_ts) * vid_name_matched_pred
+
+#             for iou_thd in iou_thds:
+#                 iou_corrects = iou_scores >= iou_thd  # bool, (n_pred, )
+#                 iou_thd_corrects_columns.append(iou_corrects[:, None])
+
+#         pred_info_matrix = np.concatenate([pred_info_matrix, ] + iou_thd_corrects_columns, axis=1)  # (n_pred, 6)
+#         pred_info_matrix_collection.append(pred_info_matrix)
+
+#     # column header [vid_name_idx (int), st (float), ed (float), is_vid_name_match (bool),
+#     # iou_scores>=iou_thd0 (bool), iou_scores>=iou_thd1 (bool)]
+#     pred_info_matrix_collection = pad_sequences_1d_np(pred_info_matrix_collection)[0]  # (n_desc, n_pred, 6)
+#     if use_desc_type:
+#         desc_types = np.array(desc_types)  # (n_desc)
+
+#     # results wrapper
+#     metrics = OrderedDict()
+#     metrics_by_type = OrderedDict()
+
+#     iou_c_offset = 4  # iou_corrects column index starts here
+#     if task_type == "VCMR":
+#         for iou_idx, iou_thd in enumerate(iou_thds):
+#             iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)  # (n_desc, n_pred)
+#             # 1) there might be more than one positive clip, so use `>= 1`
+#             for k in recall_topks:
+#                 metrics["{}-r{}".format(iou_thd, k)] = \
+#                     get_rounded_percentage(np.mean(np.sum(iou_corrects[:, :k], axis=1) >= 1))
+#         if use_desc_type:
+#             for desc_type in desc_type2idx:
+#                 type_corrects = desc_types == desc_type2idx[desc_type]  # (n_desc)
+#                 n_desc_in_type = np.sum(type_corrects)  # (n_desc)
+#                 for iou_idx, iou_thd in enumerate(iou_thds):
+#                     # (n_desc, n_pred)
+#                     iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)
+#                     for k in recall_topks:
+#                         metrics_by_type["{}-{}-r{}".format(desc_type, iou_thd, k)] = get_rounded_percentage(
+#                             1.0 * np.sum(np.logical_and(np.sum(iou_corrects[:, :k], axis=1) >= 1, type_corrects))
+#                             / n_desc_in_type
+#                         )
+#     elif task_type == "SVMR":
+#         vid_name_matched = pred_info_matrix_collection[:, :, 3].astype(bool)  # (n_desc, n_pred)
+#         n_desc = len(vid_name_matched)
+#         for iou_idx, iou_thd in enumerate(iou_thds):
+#             iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)  # (n_desc, n_pred)
+#             # 1) there might be more than one positive clip, so use `>= 1`
+#             for k in recall_topks:
+#                 metrics["{}-r{}".format(iou_thd, k)] = get_rounded_percentage(np.mean(
+#                     [np.sum(iou_corrects[idx][vid_name_matched[idx]][:k]) >= 1 for idx in range(n_desc)]
+#                 ))
+#         if use_desc_type:
+#             for desc_type in desc_type2idx:
+#                 type_corrects = desc_types == desc_type2idx[desc_type]  # (n_desc)
+#                 n_desc_in_type = np.sum(type_corrects)  # (n_desc)
+#                 for iou_idx, iou_thd in enumerate(iou_thds):
+#                     # (n_desc, n_pred)
+#                     iou_corrects = pred_info_matrix_collection[:, :, iou_c_offset + iou_idx].astype(bool)
+#                     # 1) there might be more than one positive clip, so use `>= 1`
+#                     for k in recall_topks:
+#                         metrics_by_type["{}-{}-r{}".format(desc_type, iou_thd, k)] = get_rounded_percentage(
+#                             1.0 * np.sum([np.sum(iou_corrects[idx][vid_name_matched[idx]][:k]) >= 1 and type_corrects[idx]
+#                                          for idx in range(n_desc)])
+#                             / n_desc_in_type)
+
+#     elif task_type == "VR":
+#         vid_name_matched = pred_info_matrix_collection[:, :, 3].astype(bool)  # (n_desc, n_pred)
+#         for k in recall_topks:
+#             metrics["r{}".format(k)] = \
+#                 get_rounded_percentage(np.mean(np.sum(vid_name_matched[:, :k], axis=1) >= 1))
+#         if use_desc_type:
+#             for desc_type in desc_type2idx:
+#                 type_corrects = desc_types == desc_type2idx[desc_type]  # (n_desc)
+#                 n_desc_in_type = np.sum(type_corrects)  # (n_desc)
+#                 for k in recall_topks:
+#                     metrics_by_type["{}-r{}".format(desc_type, k)] = get_rounded_percentage(
+#                         1.0 * np.sum(np.logical_and(np.sum(vid_name_matched[:, :k], axis=1) >= 1, type_corrects))
+#                         / n_desc_in_type)
+#     else:
+#         raise ValueError("task_type wrong.")
+#     if use_desc_type:
+#         metrics_by_type["desc_type_ratio"] = "v {} t {} vt {}"\
+#             .format(*[get_rounded_percentage(1.0 * np.sum(desc_types == desc_type2idx[k]) / len(desc_types))
+#                       for k in ["v", "t", "vt"]])
+#     return metrics, metrics_by_type
+
+
+# def eval_retrieval(submission, ground_truth, iou_thds=(0.5, 0.7), verbose=True, match_number=True, use_desc_type=True):
+#     video2idx = submission["video2idx"]
+#     submitted_task_types = [k for k in TASK_TYPES if k in submission]
+#     if verbose:
+#         print("Evaluating for task {}".format(submitted_task_types))
+#     eval_metrics = OrderedDict()
+#     metrics_raw_dict = {}
+#     for task_type in submitted_task_types:
+#         metrics, metrics_by_type = eval_by_task_type(
+#             submission[task_type], video2idx, ground_truth,
+#             iou_thds=iou_thds, recall_topks=(1, 10, 100),  # (1, 5, 10, 20, 50, 100),
+#             task_type=task_type, max_pred_per_query=100,
+#             match_number=match_number, verbose=verbose, use_desc_type=use_desc_type)
+#         metrics_raw_dict[task_type] = metrics
+#         metrics_raw_dict[task_type+"_by_type"] = metrics_by_type
+
+#     for task_type in submitted_task_types:
+#         eval_metrics[task_type] = metrics_raw_dict[task_type]
+#     if use_desc_type:
+#         for task_type in submitted_task_types:
+#             eval_metrics[task_type+"_by_type"] = metrics_raw_dict[task_type+"_by_type"]
+#     return eval_metrics
 
 
 def eval_main():

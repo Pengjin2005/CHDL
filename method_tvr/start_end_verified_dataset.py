@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 from utils.basic_utils import load_jsonl, load_json, l2_normalize_np_array, uniform_feature_sampling
 from utils.tensor_utils import pad_sequences_1d
-from method_tvr.config import BaseOptions
+from config import BaseOptions
 
 logger = logging.getLogger(__name__)
 
@@ -270,11 +270,11 @@ class StartEndDataset(Dataset):
         ts: [st_sec, ed_sec]，ed>st
         返回闭区间 [st_idx, ed_idx]，其中：
         st_idx = floor(st/clip_len)
-        ed_idx = ceil(ed/clip_len) - 1
+        ed_idx = ceil(ed/clip_len)
         然后 clamp 到 [0, max_idx]
         """
         st_idx = int(math.floor(ts[0] / self.clip_length))
-        ed_idx = int(math.ceil (ts[1] / self.clip_length) - 1)
+        ed_idx = int(math.ceil (ts[1] / self.clip_length))
         st_idx = max(0, min(st_idx, max_idx))
         ed_idx = max(st_idx, min(ed_idx, max_idx))
         return torch.tensor([st_idx, ed_idx], dtype=torch.long)

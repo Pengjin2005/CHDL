@@ -415,17 +415,44 @@ class HashLayer(nn.Module):
             else:
                 return HashedVector(recon, code, bin_like, x)
     
-    def xnor_popcount(self, A_packed: torch.Tensor, B_packed: torch.Tensor) -> torch.Tensor:
+    def xnor_popcount(self, A_packed: torch.Tensor, B_packed: torch.Tensor, tile_M: int = 4096) -> torch.Tensor:
         """
         A_packed: (N, nbytes) uint8
         B_packed: (M, nbytes) uint8
-        返回 matches: (N, M)  —— 每对向量的“匹配位数”（XNOR 后的 1 的数量）
+        return   : (N, M) int32 —— XNOR+popcount 匹配位数
+        说明：
+        - 分块沿 M 维计算，避免一次性构建 (N, M, nbytes)。
+        - 每块内仍用广播，但中间张量规模从 N×M×nb 降到 N×tile_M×nb。
         """
-        # 扩维做两两比较：XNOR = ~(A ^ B)
-        xnor = torch.bitwise_not(A_packed.unsqueeze(1) ^ B_packed.unsqueeze(0))  # (N, M, nbytes) uint8
-        # LUT popcount：把每个字节映射到 [0..8] 再求和
-        matches_per_byte = self._pop_lut_256[xnor]                               # (N, M, nbytes) uint8
-        matches = matches_per_byte.to(torch.int32).sum(dim=-1)                   # (N, M) int32
+        assert A_packed.dtype == torch.uint8 and B_packed.dtype == torch.uint8
+        N, nb = A_packed.shape
+        M, nb2 = B_packed.shape
+        assert nb == nb2, "nbytes mismatch"
+
+        # 结果缓冲
+        matches = A_packed.new_empty((N, M), dtype=torch.int32)
+
+        # 让张量连续可提升访问效率
+        A = A_packed.contiguous()
+        B = B_packed.contiguous()
+
+        # 分块循环（经验：4k~16k 之间找一个能跑满显存又不爆的块）
+        for j0 in range(0, M, tile_M):
+            j1 = min(j0 + tile_M, M)
+            Bj = B[j0:j1]  # (t, nbytes)
+
+            # XNOR = ~(A ^ Bj)
+            x = torch.bitwise_not(A.unsqueeze(1) ^ Bj.unsqueeze(0))      # (N, t, nbytes) uint8
+
+            # LUT popcount: uint8 -> [0..8]，再沿 nbytes 求和到 int32
+            # 注：某些 PyTorch 版本对 uint8 索引支持不一，保险起见转 long。
+            cnt = self._pop_lut_256[x.long()].to(torch.int32).sum(dim=-1)  # (N, t) int32
+
+            matches[:, j0:j1] = cnt
+
+            # 及时让中间变量出作用域，帮助显存回收
+            del x, cnt
+
         return matches
 
     @staticmethod
@@ -1629,3 +1656,101 @@ class Conv2DMomentLocalization(nn.Module):
         Ss = torch.cat(Ss_parts, dim=1)  # (Nq, Nc, L)
         Se = torch.cat(Se_parts, dim=1)  # (Nq, Nc, L)
         return Ss, Se
+
+class MultiScaleDilatedHead(nn.Module):
+    def __init__(self, ks=(3,5), dilations=(1,2,4)):
+        super().__init__()
+        banks = []
+        for k in ks:
+            for d in dilations:
+                pad = (d * (k - 1)) // 2  # stride=1 等长
+                banks.append(nn.Conv1d(1, 1, kernel_size=k, padding=pad, dilation=d, bias=False))
+        self.banks = nn.ModuleList(banks)
+        # 融合各分支：把通道数=分支数，1×1Conv 降到 1 通道
+        self.fuse = nn.Conv1d(len(banks), 1, kernel_size=1, bias=False)
+
+    def forward(self, sim):          # sim: (B, L)
+        x = sim.unsqueeze(1)         # (B, 1, L)
+        feats = [bank(x) for bank in self.banks]   # n * (B,1,L)
+        x = torch.cat(feats, dim=1)  # (B, n, L)
+        x = self.fuse(x)             # (B, 1, L)
+        return x.squeeze(1)          # (B, L)
+
+# class MultiScaleDilatedHead(nn.Module):
+#     def __init__(self, ks=(3,5), dilations=(1,2,4), fuse_type="gate", hidden_ratio=2):
+#         super().__init__()
+#         banks = []
+#         for k in ks:
+#             for d in dilations:
+#                 pad = (d * (k - 1)) // 2  # stride=1 等长
+#                 # 建议打开 bias，实际更稳
+#                 banks.append(nn.Conv1d(1, 1, kernel_size=k, padding=pad, dilation=d, bias=True))
+#         self.banks = nn.ModuleList(banks)
+
+#         n = len(banks)
+#         self.fuse_type = fuse_type
+#         h = max(4, n * hidden_ratio)  # 隐藏维，简单取 2n 或更大
+
+#         if fuse_type == "mlp":
+#             # 逐位置 MLP：等价于在通道维做 MLP（参数对所有位置共享）
+#             self.fuse = nn.Sequential(
+#                 nn.Conv1d(n, h, kernel_size=1, bias=True),
+#                 nn.GELU(),
+#                 nn.Conv1d(h, 1, kernel_size=1, bias=True),
+#             )
+#         elif fuse_type == "gate":
+#             # 逐位置门控：用 MLP 产生每个位置的 n 路权重（softmax），对分支加权求和
+#             self.gate = nn.Sequential(
+#                 nn.Conv1d(n, h, kernel_size=1, bias=True),
+#                 nn.GELU(),
+#                 nn.Conv1d(h, n, kernel_size=1, bias=True),
+#             )
+#         elif fuse_type == "se":
+#             # SE 风格：先对 L 做全局池化 -> (B,n)，用 MLP 生成样本级权重（对所有位置共享）
+#             self.se = nn.Sequential(
+#                 nn.Linear(n, h, bias=True),
+#                 nn.ReLU(inplace=True),
+#                 nn.Linear(h, n, bias=True),
+#             )
+#         else:
+#             raise ValueError(f"Unknown fuse_type: {fuse_type}")
+
+#         # 可选：轻量归一化 + 残差，提升稳健性
+#         self.norm = nn.LayerNorm(1)
+
+#         # 友好初始化：让初始行为更接近“保留原始输入”
+#         self.init_identity_bias = True
+#         if fuse_type == "mlp":
+#             with torch.no_grad():
+#                 # 让最后一层输出先偏向第0通道（相当于原来的 1×1Conv 选中某一支）
+#                 self.fuse[-1].weight.zero_()
+#                 self.fuse[-1].bias.zero_()
+#         elif fuse_type == "gate":
+#             with torch.no_grad():
+#                 # 让 gate 初始更平均或更偏向第0通道
+#                 self.gate[-1].weight.zero_()
+#                 self.gate[-1].bias.zero_()
+
+#     def forward(self, sim):          # sim: (B, L)
+#         x0 = sim.unsqueeze(1)         # (B, 1, L)
+#         feats = [bank(x0) for bank in self.banks]   # n * (B,1,L)
+#         x_cat = torch.cat(feats, dim=1)            # (B, n, L)
+
+#         if self.fuse_type == "mlp":
+#             x = self.fuse(x_cat)                   # (B, 1, L)
+
+#         elif self.fuse_type == "gate":
+#             att = torch.softmax(self.gate(x_cat), dim=1)  # (B, n, L)
+#             x = (att * x_cat).sum(dim=1, keepdim=True)    # (B, 1, L)
+
+#         elif self.fuse_type == "se":
+#             # 样本级权重：对 L 自适应池化
+#             s = F.adaptive_avg_pool1d(x_cat, 1).squeeze(-1)  # (B, n)
+#             w = torch.sigmoid(self.se(s)).unsqueeze(-1)      # (B, n, 1)
+#             x = (w * x_cat).sum(dim=1, keepdim=True)         # (B, 1, L)
+
+#         # 残差与归一化（对很多任务都更稳）
+#         x = x + x0                                           # (B, 1, L)
+#         x = x.transpose(1, 2)                                # (B, L, 1)
+#         x = self.norm(x).transpose(1, 2)                     # (B, 1, L)
+#         return x.squeeze(1)                                  # (B, L)
