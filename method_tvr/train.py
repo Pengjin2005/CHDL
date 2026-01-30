@@ -14,7 +14,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from method_tvr.config import BaseOptions
-from method_tvr.model import ReLoCLNet
+from method_tvr.model import CHDL
 from method_tvr.start_end_verified_dataset import StartEndDataset, start_end_collate, StartEndEvalDataset, prepare_batch_inputs
 from method_tvr.inference import eval_epoch, start_inference
 from method_tvr.optimization import BertAdam
@@ -323,7 +323,7 @@ def start_training():
     logger.info("model_config {}".format(model_config))
     opt.use_sub = False if "sub" not in opt.ctx_mode else True
     
-    model = ReLoCLNet(model_config)
+    model = CHDL(model_config)
     count_parameters(model)
     logger.info("Start Training...")
     train(model, train_dataset, train_eval_dataset, eval_dataset, opt)

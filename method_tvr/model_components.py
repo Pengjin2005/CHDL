@@ -415,7 +415,7 @@ class HashLayer(nn.Module):
             else:
                 return HashedVector(recon, code, bin_like, x)
     
-    def xnor_popcount(self, A_packed: torch.Tensor, B_packed: torch.Tensor, tile_M: int = 4096) -> torch.Tensor:
+    def xnor_popcount(self, A_packed: torch.Tensor, B_packed: torch.Tensor, tile_M: int = 16384) -> torch.Tensor:
         """
         A_packed: (N, nbytes) uint8
         B_packed: (M, nbytes) uint8
@@ -430,30 +430,27 @@ class HashLayer(nn.Module):
         assert nb == nb2, "nbytes mismatch"
 
         # 结果缓冲
-        matches = A_packed.new_empty((N, M), dtype=torch.int32)
+        # matches = A_packed.new_empty((N, M), dtype=torch.int32)
 
         # 让张量连续可提升访问效率
         A = A_packed.contiguous()
         B = B_packed.contiguous()
 
         # 分块循环（经验：4k~16k 之间找一个能跑满显存又不爆的块）
-        for j0 in range(0, M, tile_M):
-            j1 = min(j0 + tile_M, M)
-            Bj = B[j0:j1]  # (t, nbytes)
+        
+        # j1 = min(j0 + tile_M, M)
+        # Bj = B[j0:j1]  # (t, nbytes)
 
-            # XNOR = ~(A ^ Bj)
-            x = torch.bitwise_not(A.unsqueeze(1) ^ Bj.unsqueeze(0))      # (N, t, nbytes) uint8
+        # XNOR = ~(A ^ Bj)
+        x = torch.bitwise_not(A.unsqueeze(1) ^ B.unsqueeze(0))      # (N, t, nbytes) uint8
 
-            # LUT popcount: uint8 -> [0..8]，再沿 nbytes 求和到 int32
-            # 注：某些 PyTorch 版本对 uint8 索引支持不一，保险起见转 long。
-            cnt = self._pop_lut_256[x.long()].to(torch.int32).sum(dim=-1)  # (N, t) int32
+        # LUT popcount: uint8 -> [0..8]，再沿 nbytes 求和到 int32
+        # 注：某些 PyTorch 版本对 uint8 索引支持不一，保险起见转 long。
+        cnt = self._pop_lut_256[x.long()].to(torch.int32).sum(dim=-1)  # (N, t) int32
 
-            matches[:, j0:j1] = cnt
+        
 
-            # 及时让中间变量出作用域，帮助显存回收
-            del x, cnt
-
-        return matches
+        return cnt
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:

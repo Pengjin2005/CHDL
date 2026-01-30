@@ -1,27 +1,39 @@
 import chunk
 import copy
+import math
 from dataclasses import dataclass
 from locale import normalize
+from time import perf_counter  # <-- 导入 perf_counter
 from tkinter import NO
-from numpy import isin
+
 import torch
-import math
 import torch.nn as nn
 import torch.nn.functional as F
 from easydict import EasyDict as edict
-from method_tvr.model_components import BertAttention, LinearLayer, BertSelfAttention, TrainablePositionalEncoding, AtomicEventMomentLocalizationModule, Conv2DMomentLocalization, SpotlightMomentLocalization, MultiScaleDilatedHead
-from method_tvr.model_components import MILNCELoss, HashLayer
-from method_tvr.contrastive import batch_video_query_loss, batch_local_token_frame_loss
-from time import perf_counter  # <-- 导入 perf_counter
+from method_tvr.contrastive import batch_local_token_frame_loss, batch_video_query_loss
+from method_tvr.model_components import (
+    AtomicEventMomentLocalizationModule,
+    BertAttention,
+    BertSelfAttention,
+    Conv2DMomentLocalization,
+    HashLayer,
+    LinearLayer,
+    MILNCELoss,
+    MultiScaleDilatedHead,
+    SpotlightMomentLocalization,
+    TrainablePositionalEncoding,
+)
+from numpy import isin
+
 
 def _sync_if_cuda(tensor):
     """如果张量在GPU上，则执行 CUDA 同步"""
     if tensor is not None and isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
         torch.cuda.synchronize()
 
-class ReLoCLNet(nn.Module):
+class CHDL(nn.Module):
     def __init__(self, config):
-        super(ReLoCLNet, self).__init__()
+        super(CHDL, self).__init__()
         self.config = config
         self._epoch = 0
         # self.config.lw_rec = 1.0
@@ -93,8 +105,8 @@ class ReLoCLNet(nn.Module):
         self.temporal_criterion = nn.CrossEntropyLoss(reduction="mean")
         self.nce_criterion = MILNCELoss(reduction='mean')
 
-        self.hash1 = HashLayer(input_output_size=config.hidden_size, hidden_size=512) 
-        self.hash2 = HashLayer(input_output_size=config.hidden_size, hidden_size=512)
+        self.hash1 = HashLayer(input_output_size=config.hidden_size, hidden_size=1024) 
+        self.hash2 = HashLayer(input_output_size=config.hidden_size, hidden_size=1024)
         
         # self.video_aggregator = AdditiveAttention(config.hidden_size, config.hidden_size)
         # self.sub_aggregator = AdditiveAttention(config.hidden_size, config.hidden_size)
@@ -384,7 +396,7 @@ class ReLoCLNet(nn.Module):
         """
         # L_q ：让每一位→±1
         x = B.abs() - 1.0
-        lq_map = ReLoCLNet._log_cosh(x) if smooth_abs else x.abs()
+        lq_map = CHDL._log_cosh(x) if smooth_abs else x.abs()
         L_q = lq_map.mean() if reduction == "mean" else lq_map.sum()
 
         # L_b ：让各位在 batch 内均值为 0
@@ -427,8 +439,8 @@ class ReLoCLNet(nn.Module):
 
     #     # 两个正则：对 query 与 context 各算一遍后相加
     #     Lq_q, Lb_q, Lr_q = hash_layer.regularizers(modularied_query)
-    #     # Lq_c, Lb_c, Lr_c = hash_layer.regularizers(hv_c)
-    #     reg = {"L_q": Lq_q + Lq_q, "L_b": Lb_q + Lb_q, "L_r": Lr_q + Lr_q}
+    #     Lq_c, Lb_c, Lr_c = hash_layer.regularizers(hv_c)
+    #     reg = {"L_q": Lq_q + Lq_c, "L_b": Lb_q + Lb_c, "L_r": Lr_q + Lr_c}
     #     return scores, reg
 
     @staticmethod
@@ -455,11 +467,12 @@ class ReLoCLNet(nn.Module):
         # 展平上下文后过 hash 层
         context_feat_flat = context_feat.reshape(Nc * L, Dc)    # (Nc*L, D)
         hv_c = hash_layer(context_feat_flat, epoch)              # HashedVector
-
+        reg = {"L_q": 0.0, "L_b": 0.0, "L_r": 0.0}
         # 正则项（保持你原来的做法不变）
-        Lq_q, Lb_q, Lr_q = hash_layer.regularizers(modularied_query)
-        Lq_c, Lb_c, Lr_c = hash_layer.regularizers(hv_c)
-        reg = {"L_q": Lq_q + Lq_c, "L_b": Lb_q + Lb_c, "L_r": Lr_q + Lr_c}
+        if hash_layer.training:
+            Lq_q, Lb_q, Lr_q = hash_layer.regularizers(modularied_query)
+            Lq_c, Lb_c, Lr_c = hash_layer.regularizers(hv_c)
+            reg = {"L_q": Lq_q + Lq_c, "L_b": Lb_q + Lb_c, "L_r": Lr_q + Lr_c}
 
         if hash_layer.training:
             # ====== 浮点可导路径（训练）======
@@ -472,7 +485,7 @@ class ReLoCLNet(nn.Module):
             # ====== 位运算（推理）：XNOR + popcount + 线性缩放回余弦 ======
             # 生成 0/1 位并打包
             Bq01 = (modularied_query.bin_like > 0).to(torch.uint8)                 # (Nq, Dh)
-            Bc01 = (hv_c.bin_like >= 0).to(torch.uint8)                             # (Nc*L, Dh)
+            Bc01 = (hv_c.bin_like > 0).to(torch.uint8)                             # (Nc*L, Dh)
             Bq_packed = hash_layer._pack_bits(Bq01)                                # (Nq,   nbytes)
             Bc_packed = hash_layer._pack_bits(Bc01)                                # (Nc*L, nbytes)
 
@@ -489,7 +502,6 @@ class ReLoCLNet(nn.Module):
 
         scores = torch.nan_to_num(scores, nan=-1e4, posinf=1e4, neginf=-1e4)
         return scores, reg
-
     
 
     @staticmethod
@@ -694,6 +706,166 @@ class ReLoCLNet(nn.Module):
             return torch.log1p(torch.exp(neg_score - pos_score)).sum() / len(pos_score)
         else:
             raise NotImplementedError("Only support 'hinge' and 'lse'")
+
+    @torch.no_grad()
+    def export_query_hash(self, query_feat, query_mask):
+        """
+        [在线] 步骤: 仅编码查询，哈希，并返回打包的哈希码和用于MR的密集特征。
+        [V2 - 修复版] 精确复现 get_video_level_scores 中的查询二值化逻辑 ( > 0 )
+        """
+        self.eval()
+        # 1. 编码查询
+        video_query, sub_query, encoded_query = self.encode_query(query_feat, query_mask) # (Nq, D)
+        
+        # 2. 哈希查询 (hash2)
+        # 2.1 视频查询 (Video Query)
+        # 调用 hash2.forward() 获取 HashedVector
+        hv_q_vid = self.hash2(video_query, self.eta, export_packed=False) # (Nq, D)
+        # 精确复现: (bin_like > 0)
+        # hv_q_vid.bin_like 在 eval 模式下是 torch.sign(code)
+        bits01_vid = (hv_q_vid.bin_like > 0).to(torch.uint8) 
+        packed_q_vid = self.hash2._pack_bits(bits01_vid)
+
+        # 2.2 字幕查询 (Sub Query)
+        packed_q_sub = None
+        if self.config.ctx_mode == "video_sub":
+             hv_q_sub = self.hash2(sub_query, self.eta, export_packed=False)
+             # 精确复现: (bin_like > 0)
+             bits01_sub = (hv_q_sub.bin_like > 0).to(torch.uint8)
+             packed_q_sub = self.hash2._pack_bits(bits01_sub)
+
+        # 返回VR用的打包哈希码，和MR用的密集查询特征
+        return packed_q_vid, packed_q_sub, video_query, sub_query
+
+    @torch.no_grad()
+    def export_context_index(self, video_feat, video_mask, sub_feat, sub_mask):
+        """
+        [离线] 步骤: 编码上下文，哈希所有帧，并返回索引。
+        [V2 - 修复版] 精确复现 get_video_level_scores 中的上下文二值化逻辑 ( >= 0 )
+        """
+        self.eval()
+        # 1. 获取上下文的密集特征
+        # 确保你已经应用了上一轮的修复 (return_mid_output=True)
+        _, _, _, _, x_video_feat, x_sub_feat = self.encode_context(
+            video_feat, video_mask, sub_feat, sub_mask, return_mid_output=True
+        ) # (Nc, L, D)
+
+        Nc, L, D = x_video_feat.shape
+        
+        # 2. 为VR创建哈希索引 (hash1)
+        # 2.1 视频哈希 (Video Hash)
+        video_frames_flat = x_video_feat.reshape(Nc * L, D)
+        # 调用 hash1.forward() 获取 HashedVector
+        hv_c_vid = self.hash1(video_frames_flat, self.eta, export_packed=False)
+        # 精确复现: (bin_like >= 0)
+        # hv_c_vid.bin_like 在 eval 模式下是 torch.sign(code)
+        bits01_vid = (hv_c_vid.bin_like >= 0).to(torch.uint8)
+        packed_bits_vid = self.hash1._pack_bits(bits01_vid)
+
+        # 2.2 字幕哈希 (Sub Hash)
+        packed_bits_sub = None
+        use_sub = (sub_feat is not None and x_sub_feat is not None)
+        if use_sub:
+            sub_frames_flat = x_sub_feat.reshape(Nc * L, D)
+            hv_c_sub = self.hash1(sub_frames_flat, self.eta, export_packed=False)
+            # 精确复现: (bin_like >= 0)
+            bits01_sub = (hv_c_sub.bin_like >= 0).to(torch.uint8)
+            packed_bits_sub = self.hash1._pack_bits(bits01_sub)
+        
+        # 3. 返回所有需要的数据
+        indexed_data = {
+            "vr_video_hash": packed_bits_vid, # (Nc*L, nbytes)
+            "vr_sub_hash": packed_bits_sub,   # (Nc*L, nbytes) or None
+            "mr_video_feat": x_video_feat,    # (Nc, L, D) - MR的密集特征
+            "mr_sub_feat": x_sub_feat,      # (Nc, L, D) or None
+            "video_mask": video_mask,       # (Nc, L)
+        }
+        return indexed_data
+
+    @torch.no_grad()
+    def get_pred_from_indexed_query(self, 
+                                    packed_q_vid, packed_q_sub,       # 来自 export_query_hash
+                                    video_query, sub_query,           # (Nq, D) 密集查询
+                                    indexed_ctx,                      # 来自 export_context_index
+                                    opt, timing_dict=None):
+        """
+        [在线] 步骤: 使用预先计算的上下文索引，快速计算VR和MR分数。
+        """
+        self.eval()
+        do_time = (timing_dict is not None)
+        
+        # 1. 解包预加载的上下文索引 (已在GPU上)
+        packed_ctx_vid = indexed_ctx["vr_video_hash"]   # (Nc*L, nbytes)
+        packed_ctx_sub = indexed_ctx["vr_sub_hash"]   # (Nc*L, nbytes)
+        ctx_video_feat = indexed_ctx["mr_video_feat"]   # (Nc, L, D)
+        ctx_sub_feat = indexed_ctx["mr_sub_feat"]     # (Nc, L, D)
+        ctx_video_mask = indexed_ctx["video_mask"]    # (Nc, L)
+
+        Nq = packed_q_vid.shape[0]
+        Nc, L, D = ctx_video_feat.shape
+        Dh = self.hash1.encoder[-1].out_features # 哈希位数
+
+        use_sub = (packed_q_sub is not None and packed_ctx_sub is not None and ctx_sub_feat is not None)
+
+        # === 2. VR 任务 (哈希) ===
+        if do_time: t0_vr = perf_counter()
+
+        # 视频VR (极快)
+        matches_vid = self.hash1.xnor_popcount(packed_q_vid, packed_ctx_vid) # (Nq, Nc*L)
+        # 转换回 [-1, 1] 相似度
+        sims_vid_flat = (2.0 * matches_vid.float() - float(Dh)) / float(Dh)   # (Nq, Nc*L)
+        sims_vid_qnl = sims_vid_flat.view(Nq, Nc, L)
+        sims_vid_mln = sims_vid_qnl.permute(0, 2, 1).contiguous()         # (Nq, L, Nc)
+
+        if use_sub:
+            # 字幕VR (极快)
+            matches_sub = self.hash1.xnor_popcount(packed_q_sub, packed_ctx_sub) # (Nq, Nc*L)
+            sims_sub_flat = (2.0 * matches_sub.float() - float(Dh)) / float(Dh)   # (Nq, Nc*L)
+            sims_sub_qnl = sims_sub_flat.view(Nq, Nc, L)
+            sims_sub_mln = sims_sub_qnl.permute(0, 2, 1).contiguous()     # (Nq, L, Nc)
+            
+            sims_mln = (sims_vid_mln + sims_sub_mln) / 2.0
+        else:
+            sims_mln = sims_vid_mln
+            
+        # 掩码 & Max-Pooling (极快)
+        cm = ctx_video_mask.transpose(0, 1).unsqueeze(0)  # (1, L, Nc)
+        sims_mln = mask_logits(sims_mln, cm)              # (Nq, L, Nc)
+        q2ctx_scores = sims_mln.max(dim=1).values         # (Nq, Nc)
+        q2ctx_scores = torch.nan_to_num(q2ctx_scores, nan=-1e4, posinf=1e4, neginf=-1e4)
+        q2ctx_scores = torch.exp(opt.q2c_alpha * q2ctx_scores) # (同原始脚本)
+        
+        if do_time: 
+            _sync_if_cuda(opt)
+            # 计时: VR分数计算 (xnor + pool)
+            timing_dict["vr_score_calc_s"] = timing_dict.get("vr_score_calc_s", 0.0) + (perf_counter() - t0_vr)
+
+        # === 3. MR 任务 (密集) ===
+        # 注意: MR 仍然是密集的，需要 Nq vs Nc 的密集计算
+        if do_time: t0_mr = perf_counter()
+
+        # 密集相似度 (Nq, Nc, L) - 这是MR的主要开销
+        similarity = self.get_merged_score(
+            video_query, ctx_video_feat, 
+            sub_query if use_sub else None, 
+            ctx_sub_feat if use_sub else None, 
+            cross=True
+        ) # (Nq, Nc, L)
+
+        # 扩展掩码以匹配 (Nq, Nc, L)
+        ctx_mask_expanded = ctx_video_mask.unsqueeze(0).expand(Nq, Nc, L) # (Nq, Nc, L)
+        st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, ctx_mask_expanded, cross=True)
+        
+        # Softmax (同原始脚本)
+        st_prob = F.softmax(st_prob, dim=-1) # (Nq, Nc, L)
+        ed_prob = F.softmax(ed_prob, dim=-1)
+
+        if do_time: 
+            _sync_if_cuda(opt)
+            # 计时: MR概率计算 (dense matmul + conv)
+            timing_dict["mr_prob_calc_s"] = timing_dict.get("mr_prob_calc_s", 0.0) + (perf_counter() - t0_mr)
+
+        return q2ctx_scores, st_prob, ed_prob
 
 
 def mask_logits(target: torch.Tensor, mask: torch.Tensor, neg_fill: float = -1e4):

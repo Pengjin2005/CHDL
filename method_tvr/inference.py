@@ -1,23 +1,28 @@
+import logging
 import os
 import pprint
-import logging
 import time
-import numpy as np
-from tqdm import tqdm
 from collections import defaultdict
+from time import perf_counter
+
+import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from method_tvr.config import TestOptions
-from method_tvr.model import ReLoCLNet
-from method_tvr.start_end_verified_dataset import start_end_collate, StartEndEvalDataset, prepare_batch_inputs
-from utils.basic_utils import save_json, load_json
+from method_tvr.model import CHDL
+from method_tvr.start_end_dataset import (
+    StartEndEvalDataset,
+    prepare_batch_inputs,
+    start_end_collate,
+)
+from standalone_eval.eval import eval_retrieval
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from utils.basic_utils import load_json, save_json
 from utils.temporal_nms import temporal_non_maximum_suppression
 from utils.tensor_utils import find_max_triples_from_upper_triangle_product
-from standalone_eval.eval import eval_retrieval
 
-from time import perf_counter
 
 def _sync_if_cuda(opt):
     if getattr(opt, "device", None) is not None and getattr(opt.device, "type", "") == "cuda":
@@ -175,6 +180,7 @@ def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_bef
     estimated size 20,000 (query) * 500 (hsz) * 4 / (1024**2) = 38.15 MB
     max_n_videos: int, use max_n_videos videos for computing VCMR results
     """
+    n_total_query = len(eval_dataset)
     timing = {
         "model_forward_s": 0.0,     # 前向 + 生成 st/ed 概率
         "svmr_decode_s": 0.0,       # 仅提取/写入 SVMR 概率矩阵部分
@@ -419,6 +425,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
                 _st_probs[row_indices, query2video_meta_indices].cpu().numpy()
             svmr_gt_ed_probs[idx * bsz:(idx + 1) * bsz, :_ed_probs.shape[2]] = \
                 _ed_probs[row_indices, query2video_meta_indices].cpu().numpy()
+            torch.cuda.synchronize()
             timing["svmr_decode_s"] += (perf_counter() - t_s)
 
         if not (is_vr or is_vcmr):
@@ -434,6 +441,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
             _sorted_q2c_indices = _query_context_scores.new_tensor([[video_idx2meta_idx[sub_e[0]] for sub_e in e] for e in relevant_video_info], dtype=torch.long)
             _sorted_q2c_scores = _query_context_scores.new_tensor([[sub_e[3] for sub_e in e] for e in relevant_video_info])
             _sorted_q2c_scores = torch.exp(opt.q2c_alpha * _sorted_q2c_scores)
+        torch.cuda.synchronize()
         timing["vr_rank_s"] += (perf_counter() - t_vr)
 
         # collect data for vr and backup_vcmr
@@ -537,6 +545,368 @@ def get_eval_res(model, eval_dataset, opt, tasks):
     return eval_res, timing
 
 
+def create_offline_index(model, eval_dataset, opt):
+    """
+    [离线步骤] 遍历所有上下文数据，计算特征和哈希码，并保存到磁盘。
+    """
+    logger.info("Starting offline index creation...")
+    model.eval()
+    eval_dataset.set_data_mode("context")
+    context_dataloader = DataLoader(eval_dataset, collate_fn=start_end_collate, batch_size=opt.eval_context_bsz,
+                                  num_workers=opt.num_workers, shuffle=False, pin_memory=opt.pin_memory)
+    
+    metas = []
+    # 收集所有批次的索引数据
+    all_indexed_data_batches = {
+        "vr_video_hash": [], "vr_sub_hash": [],
+        "mr_video_feat": [], "mr_sub_feat": [],
+        "video_mask": []
+    }
+    
+    with torch.no_grad():
+        for idx, batch in tqdm(enumerate(context_dataloader), desc="Indexing context batches",
+                               total=len(context_dataloader)):
+            metas.extend(batch[0])
+            model_inputs = prepare_batch_inputs(batch[1], device=opt.device, non_blocking=opt.pin_memory)
+            
+            # 使用新的模型函数获取此批次的索引数据
+            indexed_batch = model.export_context_index(
+                model_inputs["video_feat"], model_inputs["video_mask"],
+                model_inputs["sub_feat"], model_inputs["sub_mask"]
+            )
+            
+            # 收集数据块 (转移到CPU以节省VRAM)
+            all_indexed_data_batches["vr_video_hash"].append(indexed_batch["vr_video_hash"].cpu())
+            if indexed_batch["vr_sub_hash"] is not None:
+                all_indexed_data_batches["vr_sub_hash"].append(indexed_batch["vr_sub_hash"].cpu())
+            
+            all_indexed_data_batches["mr_video_feat"].append(indexed_batch["mr_video_feat"].cpu())
+            if indexed_batch["mr_sub_feat"] is not None:
+                all_indexed_data_batches["mr_sub_feat"].append(indexed_batch["mr_sub_feat"].cpu())
+                
+            all_indexed_data_batches["video_mask"].append(indexed_batch["video_mask"].cpu())
+
+    logger.info("Concatenating index tensors...")
+    
+    # 辅助函数：连接(B, L, D)或(B, L)张量，处理padding
+    def cat_tensor_with_padding(tensor_list):
+        if not tensor_list: 
+            return None
+        max_l = max(t.shape[1] for t in tensor_list)
+        total_b = sum(t.shape[0] for t in tensor_list)
+        
+        if len(tensor_list[0].shape) == 3: # (B, L, D)
+            hsz = tensor_list[0].shape[2]
+            out_tensor = torch.zeros((total_b, max_l, hsz), dtype=tensor_list[0].dtype)
+        else: # (B, L)
+            out_tensor = torch.zeros((total_b, max_l), dtype=tensor_list[0].dtype)
+        
+        b_start = 0
+        for t in tensor_list:
+            b_end = b_start + t.shape[0]
+            l_t = t.shape[1]
+            if len(t.shape) == 3:
+                out_tensor[b_start:b_end, :l_t, :] = t
+            else:
+                out_tensor[b_start:b_end, :l_t] = t
+            b_start = b_end
+        return out_tensor
+
+    # 拼接所有数据块
+    final_index = {
+        "video_metas": metas,
+        # 哈希码是扁平的 (Nc*L, nbytes)，直接cat
+        "vr_video_hash": torch.cat(all_indexed_data_batches["vr_video_hash"], dim=0),
+        "vr_sub_hash": torch.cat(all_indexed_data_batches["vr_sub_hash"], dim=0) if all_indexed_data_batches["vr_sub_hash"] else None,
+        # 密集特征和掩码需要paddings
+        "mr_video_feat": cat_tensor_with_padding(all_indexed_data_batches["mr_video_feat"]),
+        "mr_sub_feat": cat_tensor_with_padding(all_indexed_data_batches["mr_sub_feat"]),
+        "video_mask": cat_tensor_with_padding(all_indexed_data_batches["video_mask"]),
+    }
+    
+    logger.info(f"VR Video Hash (Nc*L, nbytes): {final_index['vr_video_hash'].shape}")
+    logger.info(f"MR Video Feat (Nc, L, D): {final_index['mr_video_feat'].shape}")
+    
+    # 保存索引到磁盘
+    index_path = os.path.join(opt.results_dir, f"offline_index_{opt.dset_name}_{opt.eval_split_name}.pt")
+    torch.save(final_index, index_path)
+    logger.info(f"Offline index saved to {index_path}")
+    return index_path
+
+def online_query_loop(model, eval_dataset, opt, indexed_ctx, max_before_nms=1000, max_n_videos=100, tasks=("SVMR",)):
+    """
+    [在线步骤] 加载预计算的索引，遍历查询，执行快速匹配。
+    此函数替换 compute_query2ctx_info。
+    """
+    # 1. 准备 (与 compute_query2ctx_info 相同)
+    is_svmr = "SVMR" in tasks
+    is_vr = "VR" in tasks
+    is_vcmr = "VCMR" in tasks
+    video2idx = eval_dataset.video2idx
+    video_metas = indexed_ctx["video_metas"] # 从索引中加载
+    
+    model.eval()
+    eval_dataset.set_data_mode("query")
+    eval_dataset.load_gt_vid_name_for_query(is_svmr)
+    query_eval_loader = DataLoader(eval_dataset, collate_fn=start_end_collate, batch_size=opt.eval_query_bsz,
+                                 num_workers=opt.num_workers, shuffle=False, pin_memory=opt.pin_memory)
+    n_total_query = len(eval_dataset)
+    bsz = opt.eval_query_bsz
+
+    timing = {
+        "query_hash_s": 0.0,      # 新增：查询哈希时间
+        "vr_score_calc_s": 0.0, # 新增：VR哈希匹配+池化时间
+        "mr_prob_calc_s": 0.0,  # 新增：MR密集计算时间
+        "svmr_decode_s": 0.0,
+        "vr_rank_s": 0.0,
+        "vcmr_decode_s": 0.0,
+        "n_batches": 0,
+        "n_queries": n_total_query
+    }
+
+    # 2. 将整个索引加载到GPU (关键一步)
+    logger.info("Moving context index to GPU...")
+    indexed_ctx_gpu = {}
+    for k, v in indexed_ctx.items():
+        if isinstance(v, torch.Tensor):
+            indexed_ctx_gpu[k] = v.to(opt.device, non_blocking=opt.pin_memory)
+    indexed_ctx_gpu["video_metas"] = indexed_ctx["video_metas"] # Metas 留在CPU
+    logger.info("Index moved to GPU.")
+
+    # 3. 准备结果缓冲区 (与 compute_query2ctx_info 相同)
+    if is_vcmr:
+        flat_st_ed_scores_sorted_indices = np.empty((n_total_query, max_before_nms), dtype=np.int32)
+        flat_st_ed_sorted_scores = np.zeros((n_total_query, max_before_nms), dtype=np.float32)
+    else:
+        flat_st_ed_scores_sorted_indices, flat_st_ed_sorted_scores = None, None
+
+    if is_vr or is_vcmr:
+        sorted_q2c_indices = np.empty((n_total_query, max_n_videos), dtype=np.int32)
+        sorted_q2c_scores = np.empty((n_total_query, max_n_videos), dtype=np.float32)
+    else:
+        sorted_q2c_indices, sorted_q2c_scores = None, None
+
+    if is_svmr:
+        svmr_video2meta_idx = {e["vid_name"]: idx for idx, e in enumerate(video_metas)}
+        svmr_gt_st_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
+        svmr_gt_ed_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
+    else:
+        svmr_video2meta_idx, svmr_gt_st_probs, svmr_gt_ed_probs = None, None, None
+
+    # 4. 在线查询循环
+    query_metas = []
+    for idx, batch in tqdm(enumerate(query_eval_loader), desc="Online Query", total=len(query_eval_loader)):
+        timing["n_batches"] += 1
+        
+        _query_metas = batch[0]
+        query_metas.extend(batch[0])
+        model_inputs = prepare_batch_inputs(batch[1], device=opt.device, non_blocking=opt.pin_memory)
+        
+        # === 核心变化：在线计算 ===
+        
+        # 4.1. 哈希查询 (快)
+        t_qhash = perf_counter()
+        packed_q_vid, packed_q_sub, video_query, sub_query = model.export_query_hash(
+            model_inputs["query_feat"], model_inputs["query_mask"]
+        )
+        _sync_if_cuda(opt)
+        timing["query_hash_s"] += (perf_counter() - t_qhash)
+
+        # 4.2. 用索引计算分数 (VR快, MR慢)
+        # timing 字典会被传入并在内部更新 "vr_score_calc_s" 和 "mr_prob_calc_s"
+        _query_context_scores, _st_probs, _ed_probs = model.get_pred_from_indexed_query(
+            packed_q_vid, packed_q_sub,
+            video_query, sub_query,
+            indexed_ctx_gpu, # 传入已在GPU上的索引
+            opt, timing_dict=timing
+        )
+        # === 结束 ===
+
+        # 5. 后处理 (与 compute_query2ctx_info 完全相同)
+        if is_svmr: 
+            t_s = perf_counter()
+            row_indices = torch.arange(0, len(_st_probs))
+            query2video_meta_indices = torch.tensor([svmr_video2meta_idx[e["vid_name"]] for e in _query_metas],
+                                                    dtype=torch.long)
+            svmr_gt_st_probs[idx * bsz:(idx + 1) * bsz, :_st_probs.shape[2]] = \
+                _st_probs[row_indices, query2video_meta_indices].cpu().numpy()
+            svmr_gt_ed_probs[idx * bsz:(idx + 1) * bsz, :_ed_probs.shape[2]] = \
+                _ed_probs[row_indices, query2video_meta_indices].cpu().numpy()
+            timing["svmr_decode_s"] += (perf_counter() - t_s)
+        
+        if not (is_vr or is_vcmr):
+            continue
+
+        t_vr = perf_counter()
+        _sorted_q2c_scores, _sorted_q2c_indices = torch.topk(_query_context_scores, max_n_videos, dim=1,
+                                                             largest=True)
+        timing["vr_rank_s"] += (perf_counter() - t_vr)
+
+        sorted_q2c_indices[idx * bsz:(idx + 1) * bsz] = _sorted_q2c_indices.cpu().numpy()
+        sorted_q2c_scores[idx * bsz:(idx + 1) * bsz] = _sorted_q2c_scores.cpu().numpy()
+        
+        if not is_vcmr:
+            continue
+            
+        t_vcmr = perf_counter()
+        row_indices = torch.arange(0, len(_st_probs), device=opt.device).unsqueeze(1)
+        _st_probs_sel = _st_probs[row_indices, _sorted_q2c_indices] 
+        _ed_probs_sel = _ed_probs[row_indices, _sorted_q2c_indices]
+        _st_ed_scores = torch.einsum("qvm,qv,qvn->qvmn", _st_probs_sel, _sorted_q2c_scores, _ed_probs_sel)
+        valid_prob_mask = generate_min_max_length_mask(_st_ed_scores.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
+        _st_ed_scores *= torch.from_numpy(valid_prob_mask).to(_st_ed_scores.device)
+        _n_q = _st_ed_scores.shape[0]
+        _flat = _st_ed_scores.reshape(_n_q, -1)
+        _flat_st_ed_sorted_scores, _flat_st_ed_scores_sorted_indices = torch.sort(_flat, dim=1, descending=True)
+        _sync_if_cuda(opt)
+        timing["vcmr_decode_s"] += (perf_counter() - t_vcmr)
+        
+        flat_st_ed_sorted_scores[idx * bsz:(idx + 1)*bsz] = _flat_st_ed_sorted_scores[:, :max_before_nms].cpu().numpy()
+        flat_st_ed_scores_sorted_indices[idx * bsz:(idx + 1) * bsz] = \
+            _flat_st_ed_scores_sorted_indices[:, :max_before_nms].cpu().numpy()
+        if opt.debug:
+            break
+
+    # 6. 组装结果 (与 compute_query2ctx_info 完全相同)
+    svmr_res = []
+    if is_svmr:
+        svmr_res = get_svmr_res_from_st_ed_probs(svmr_gt_st_probs, svmr_gt_ed_probs, query_metas, video2idx,
+                                                 clip_length=opt.clip_length, min_pred_l=opt.min_pred_l,
+                                                 max_pred_l=opt.max_pred_l, max_before_nms=max_before_nms)
+    vr_res = []
+    if is_vr:
+        for i, (_sorted_q2c_scores_row, _sorted_q2c_indices_row) in tqdm(
+                enumerate(zip(sorted_q2c_scores[:, :100], sorted_q2c_indices[:, :100])),
+                desc="[VR] Loop over queries to generate predictions", total=n_total_query):
+            cur_vr_redictions = []
+            for j, (v_score, v_meta_idx) in enumerate(zip(_sorted_q2c_scores_row, _sorted_q2c_indices_row)):
+                video_idx = video2idx[video_metas[v_meta_idx]["vid_name"]]
+                cur_vr_redictions.append([video_idx, 0, 0, float(v_score)])
+            cur_query_pred = dict(desc_id=query_metas[i]['desc_id'], desc=query_metas[i]["desc"],
+                                  predictions=cur_vr_redictions)
+            vr_res.append(cur_query_pred)
+
+    vcmr_res = []
+    if is_vcmr:
+        for i, (_flat_st_ed_scores_sorted_indices, _flat_st_ed_sorted_scores) in tqdm(
+                enumerate(zip(flat_st_ed_scores_sorted_indices, flat_st_ed_sorted_scores)),
+                desc="[VCMR] Loop over queries to generate predictions", total=n_total_query): 
+            video_meta_indices_local, pred_st_indices, pred_ed_indices = np.unravel_index(
+                _flat_st_ed_scores_sorted_indices, shape=(max_n_videos, opt.max_ctx_l, opt.max_ctx_l))
+            video_meta_indices = sorted_q2c_indices[i, video_meta_indices_local]
+            pred_st_in_seconds = pred_st_indices.astype(np.float32) * opt.clip_length
+            pred_ed_in_seconds = pred_ed_indices.astype(np.float32) * opt.clip_length
+            cur_vcmr_redictions = []
+            for j, (v_meta_idx, v_score) in enumerate(zip(video_meta_indices, _flat_st_ed_sorted_scores)): 
+                video_idx = video2idx[video_metas[v_meta_idx]["vid_name"]]
+                cur_vcmr_redictions.append([video_idx, float(pred_st_in_seconds[j]), float(pred_ed_in_seconds[j]),
+                                            float(v_score)])
+            cur_query_pred = dict(desc_id=query_metas[i]["desc_id"], desc=query_metas[i]["desc"],
+                                  predictions=cur_vcmr_redictions)
+            vcmr_res.append(cur_query_pred)
+
+    res = dict(SVMR=svmr_res, VCMR=vcmr_res, VR=vr_res)
+    return {k: v for k, v in res.items() if len(v) != 0}, timing
+
+def eval_epoch_onoff(model, eval_dataset, opt, save_submission_filename, tasks=("SVMR",), max_after_nms=100):
+    """
+    [在线步骤] 评估的主函数。
+    它会加载或创建离线索引，然后执行在线查询。
+    """
+    model.eval()
+    
+    # 1. 检查或创建离线索引
+    index_path = os.path.join(opt.results_dir, f"offline_index_{opt.dset_name}_{opt.eval_split_name}.pt")
+    
+    # 你可以添加一个
+    # --force_reindex 
+    # 启动参数来强制重新生成索引
+    if not os.path.exists(index_path) or getattr(opt, "force_reindex", False):
+        logger.info(f"Index not found or force_reindex=True. Creating offline index at {index_path}...")
+        # 调用离线索引函数 (这会很慢，只做一次)
+        create_offline_index(model, eval_dataset, opt)
+    
+    # 2. 加载索引
+    logger.info(f"Loading pre-computed index from {index_path}...")
+    # 将索引加载到 CPU 内存
+    indexed_ctx = torch.load(index_path, map_location="cpu")
+    
+    # 3. 执行在线查询
+    logger.info("Starting online query processing...")
+    st_time = time.time()
+    
+    # 调用新的在线查询循环
+    eval_submission_raw, timing = online_query_loop(
+        model, eval_dataset, opt, indexed_ctx, 
+        max_before_nms=opt.max_before_nms, 
+        max_n_videos=opt.max_vcmr_video, 
+        tasks=tasks
+    )
+    
+    total_time = time.time() - st_time
+    print("\n" + "\x1b[1;31m" + f"Total Online Query Time: {total_time:.2f}s" + "\x1b[0m", flush=True)
+
+    # 4. 后处理 (与原始 eval_epoch 完全相同)
+    eval_submission_raw["video2idx"] = eval_dataset.video2idx
+    
+    # ---- 计时 & 保存 (与原始 eval_epoch 相同) ----
+    avg_ms = {}
+    n_q = max(1, timing.get("n_queries", 1))
+    for k, v in timing.items():
+        if k.startswith("n_"):
+            continue
+        avg_ms[k.replace("_s", "_ms_per_query")] = (v / n_q) * 1000.0
+    avg_ms["total_ms_per_query"] = (total_time / n_q) * 1000.0
+
+    timing_out = dict(
+        n_queries=n_q,
+        n_batches=timing.get("n_batches", None),
+        avg_ms_per_query=avg_ms
+    )
+    submission_path = os.path.join(opt.results_dir, save_submission_filename)
+    timings_path = submission_path.replace(".json", "_timings.json")
+    save_json(timing_out, timings_path)
+
+    IOU_THDS = (0.5, 0.7) 
+    logger.info("Saving/Evaluating before nms results")
+    submission_path = os.path.join(opt.results_dir, save_submission_filename)
+    eval_submission = get_submission_top_n(eval_submission_raw, top_n=max_after_nms)
+    save_json(eval_submission, submission_path)
+
+    if opt.eval_split_name == "val": 
+        metrics = eval_retrieval(eval_submission, eval_dataset.query_data, iou_thds=IOU_THDS,
+                                 match_number=not opt.debug, verbose=opt.debug, use_desc_type=opt.dset_name == "tvr")
+        save_metrics_path = submission_path.replace(".json", "_metrics.json")
+        save_json(metrics, save_metrics_path, save_pretty=True, sort_keys=False)
+        latest_file_paths = [submission_path, save_metrics_path]
+    else:
+        metrics = None
+        latest_file_paths = [submission_path, ]
+
+    if opt.nms_thd != -1:
+        logger.info("Performing nms with nms_thd {}".format(opt.nms_thd))
+        eval_submission_after_nms = dict(video2idx=eval_submission_raw["video2idx"])
+        for k, nms_func in POST_PROCESSING_MMS_FUNC.items():
+            if k in eval_submission_raw:
+                eval_submission_after_nms[k] = nms_func(eval_submission_raw[k], nms_thd=opt.nms_thd,
+                                                        max_before_nms=opt.max_before_nms, max_after_nms=max_after_nms)
+        logger.info("Saving/Evaluating nms results")
+        submission_nms_path = submission_path.replace(".json", "_nms_thd_{}.json".format(opt.nms_thd))
+        save_json(eval_submission_after_nms, submission_nms_path)
+        if opt.eval_split_name == "val":
+            metrics_nms = eval_retrieval(eval_submission_after_nms, eval_dataset.query_data, iou_thds=IOU_THDS,
+                                         match_number=not opt.debug, verbose=opt.debug)
+            save_metrics_nms_path = submission_nms_path.replace(".json", "_metrics.json")
+            save_json(metrics_nms, save_metrics_nms_path, save_pretty=True, sort_keys=False)
+            latest_file_paths += [submission_nms_path, save_metrics_nms_path]
+        else:
+            metrics_nms = None
+            latest_file_paths = [submission_nms_path, ]
+    else:
+        metrics_nms = None
+    return metrics, metrics_nms, latest_file_paths
+
+
 POST_PROCESSING_MMS_FUNC = {"SVMR": post_processing_svmr_nms, "VCMR": post_processing_vcmr_nms}
 
 
@@ -611,7 +981,7 @@ def setup_model(opt):
     """Load model from checkpoint and move to specified device"""
     checkpoint = torch.load(opt.ckpt_filepath)
     loaded_model_cfg = checkpoint["model_cfg"]
-    model = ReLoCLNet(loaded_model_cfg)
+    model = CHDL(loaded_model_cfg)
     model.load_state_dict(checkpoint["model"])
     logger.info("Loaded model saved at epoch {} from checkpoint: {}".format(checkpoint["epoch"], opt.ckpt_filepath))
 
