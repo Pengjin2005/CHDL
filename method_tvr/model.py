@@ -1,33 +1,25 @@
-import chunk
 import copy
 import math
-from dataclasses import dataclass
-from locale import normalize
-from time import perf_counter  # <-- 导入 perf_counter
-from tkinter import NO
+from time import perf_counter
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from easydict import EasyDict as edict
-from method_tvr.contrastive import batch_local_token_frame_loss, batch_video_query_loss
+from method_tvr.contrastive import batch_local_token_frame_loss
 from method_tvr.model_components import (
     AtomicEventMomentLocalizationModule,
     BertAttention,
     BertSelfAttention,
-    Conv2DMomentLocalization,
     HashLayer,
     LinearLayer,
     MILNCELoss,
     MultiScaleDilatedHead,
-    SpotlightMomentLocalization,
     TrainablePositionalEncoding,
 )
-from numpy import isin
 
 
 def _sync_if_cuda(tensor):
-    """如果张量在GPU上，则执行 CUDA 同步"""
     if tensor is not None and isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
         torch.cuda.synchronize()
 

@@ -6,3 +6,5 @@ figures/
 data
 
 cpde/
+
+.vscode/
