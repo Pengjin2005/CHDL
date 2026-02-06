@@ -9,16 +9,17 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from method_tvr.config import TestOptions
-from method_tvr.model import CHDL
-from method_tvr.start_end_dataset import (
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from chdl.config import TestOptions
+from chdl.dataset import (
     StartEndEvalDataset,
     prepare_batch_inputs,
     start_end_collate,
 )
-from standalone_eval.eval import eval_retrieval
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+from chdl.model import CHDL
+from eval.eval import eval_retrieval
 from utils.basic_utils import load_json, save_json
 from utils.temporal_nms import temporal_non_maximum_suppression
 from utils.tensor_utils import find_max_triples_from_upper_triangle_product

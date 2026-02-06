@@ -10,7 +10,7 @@ tasks+=(VCMR)
 tasks+=(SVMR)
 tasks+=(VR)
 echo "tasks ${tasks[@]}"
-python method_tvr/inference.py \
+python inference.py \
 --model_dir ${model_dir} \
 --tasks ${tasks[@]} \
 --eval_split_name ${eval_split_name} \

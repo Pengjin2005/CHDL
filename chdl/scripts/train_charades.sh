@@ -11,7 +11,7 @@ dset_name=$1  # see case below
 ctx_mode=$2  # [video, sub, tef, video_sub, video_tef, sub_tef, video_sub_tef]
 vid_feat_type=$3  # [resnet, i3d, resnet_i3d]
 feature_root=data
-results_root=method_tvr/results
+results_root=results
 vid_feat_size=2048
 extra_args=()
 

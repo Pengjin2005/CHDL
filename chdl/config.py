@@ -3,7 +3,7 @@ import time
 import torch
 import argparse
 from utils.basic_utils import mkdirp, load_json, save_json, make_zipfile
-from method_tvr.proposal import ProposalConfigs
+from chdl.proposal import ProposalConfigs
 
 HyperParams = {
     

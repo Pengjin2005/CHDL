@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from easydict import EasyDict as edict
-from method_tvr.contrastive import batch_local_token_frame_loss
-from method_tvr.model_components import (
+
+from chdl.components import (
     AtomicEventMomentLocalizationModule,
     BertAttention,
     BertSelfAttention,
@@ -17,11 +17,17 @@ from method_tvr.model_components import (
     MultiScaleDilatedHead,
     TrainablePositionalEncoding,
 )
+from chdl.utils import batch_local_token_frame_loss
 
 
 def _sync_if_cuda(tensor):
-    if tensor is not None and isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
+    if (
+        tensor is not None
+        and isinstance(tensor, torch.Tensor)
+        and tensor.device.type == "cuda"
+    ):
         torch.cuda.synchronize()
+
 
 class CHDL(nn.Module):
     def __init__(self, config):
@@ -34,38 +40,48 @@ class CHDL(nn.Module):
         # self.eta = nn.Parameter(torch.tensor(1.0))  # eta is a trainable parameter, initialized to 1.0
         self.eta = 1.0
         self.query_pos_embed = TrainablePositionalEncoding(
-            max_position_embeddings=config.max_desc_l, 
-            hidden_size=config.hidden_size, 
-            dropout=config.input_drop
+            max_position_embeddings=config.max_desc_l,
+            hidden_size=config.hidden_size,
+            dropout=config.input_drop,
         )
         self.ctx_pos_embed = TrainablePositionalEncoding(
-            max_position_embeddings=config.max_ctx_l, 
-            hidden_size=config.hidden_size, 
-            dropout=config.input_drop
+            max_position_embeddings=config.max_ctx_l,
+            hidden_size=config.hidden_size,
+            dropout=config.input_drop,
         )
 
         self.query_input_proj = LinearLayer(
-            config.query_input_size, 
-            config.hidden_size, 
+            config.query_input_size,
+            config.hidden_size,
             layer_norm=True,
-            dropout=config.input_drop, 
-            relu=True
+            dropout=config.input_drop,
+            relu=True,
         )
 
         self.query_encoder = BertAttention(
-            edict(hidden_size=config.hidden_size, 
-                  intermediate_size=config.hidden_size,
-                  hidden_dropout_prob=config.drop,
-                  num_attention_heads=config.n_heads,
-                  attention_probs_dropout_prob=config.drop)
+            edict(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.hidden_size,
+                hidden_dropout_prob=config.drop,
+                num_attention_heads=config.n_heads,
+                attention_probs_dropout_prob=config.drop,
             )
+        )
         self.query_encoder1 = copy.deepcopy(self.query_encoder)
 
-        cross_att_cfg = edict(hidden_size=config.hidden_size, num_attention_heads=config.n_heads,
-                              attention_probs_dropout_prob=config.drop)
+        cross_att_cfg = edict(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.n_heads,
+            attention_probs_dropout_prob=config.drop,
+        )
         # use_video
-        self.video_input_proj = LinearLayer(config.visual_input_size, config.hidden_size, layer_norm=True,
-                                            dropout=config.input_drop, relu=True)
+        self.video_input_proj = LinearLayer(
+            config.visual_input_size,
+            config.hidden_size,
+            layer_norm=True,
+            dropout=config.input_drop,
+            relu=True,
+        )
         self.video_encoder1 = copy.deepcopy(self.query_encoder)
         self.video_encoder2 = copy.deepcopy(self.query_encoder)
         self.video_encoder3 = copy.deepcopy(self.query_encoder)
@@ -74,8 +90,13 @@ class CHDL(nn.Module):
         self.video_query_linear = nn.Linear(config.hidden_size, config.hidden_size)
 
         # use_sub
-        self.sub_input_proj = LinearLayer(config.sub_input_size, config.hidden_size, layer_norm=True,
-                                          dropout=config.input_drop, relu=True)
+        self.sub_input_proj = LinearLayer(
+            config.sub_input_size,
+            config.hidden_size,
+            layer_norm=True,
+            dropout=config.input_drop,
+            relu=True,
+        )
         self.sub_encoder1 = copy.deepcopy(self.query_encoder)
         self.sub_encoder2 = copy.deepcopy(self.query_encoder)
         self.sub_encoder3 = copy.deepcopy(self.query_encoder)
@@ -83,33 +104,35 @@ class CHDL(nn.Module):
         self.sub_cross_layernorm = nn.LayerNorm(config.hidden_size)
         self.sub_query_linear = nn.Linear(config.hidden_size, config.hidden_size)
 
-        self.modular_vector_mapping = nn.Linear(in_features=config.hidden_size, out_features=2, bias=False)
+        self.modular_vector_mapping = nn.Linear(
+            in_features=config.hidden_size, out_features=2, bias=False
+        )
 
         # conv_cfg = dict(in_channels=1, out_channels=1, kernel_size=config.conv_kernel_size, stride=config.conv_stride, padding=config.conv_kernel_size // 2, bias=False)
         # self.merged_st_predictor = nn.Conv1d(**conv_cfg)
         # self.merged_ed_predictor = nn.Conv1d(**conv_cfg)
 
-        ms_ks = getattr(config, "ms_kernel_sizes", (3,5,9,17))
+        ms_ks = getattr(config, "ms_kernel_sizes", (3, 5, 9, 17))
         ms_dil = getattr(config, "ms_dilations", (1,))
         self.merged_st_predictor = MultiScaleDilatedHead(ms_ks, ms_dil)
         self.merged_ed_predictor = MultiScaleDilatedHead(ms_ks, ms_dil)
 
         self.temporal_criterion = nn.CrossEntropyLoss(reduction="mean")
-        self.nce_criterion = MILNCELoss(reduction='mean')
+        self.nce_criterion = MILNCELoss(reduction="mean")
 
-        self.hash1 = HashLayer(input_output_size=config.hidden_size, hidden_size=1024) 
+        self.hash1 = HashLayer(input_output_size=config.hidden_size, hidden_size=1024)
         self.hash2 = HashLayer(input_output_size=config.hidden_size, hidden_size=1024)
-        
+
         # self.video_aggregator = AdditiveAttention(config.hidden_size, config.hidden_size)
         # self.sub_aggregator = AdditiveAttention(config.hidden_size, config.hidden_size)
 
         self.moment = AtomicEventMomentLocalizationModule(
             d_model=config.hidden_size,
             n_heads=8,
-            decoder="pointer",            # 或 "pointer"
+            decoder="pointer",  # 或 "pointer"
             boundary_percentile=95.0,
             smooth_kernel=5,
-            latent_dim=32
+            latent_dim=32,
         )
 
         # self.moment = SpotlightMomentLocalization(
@@ -130,7 +153,8 @@ class CHDL(nn.Module):
         # )
 
     def reset_parameters(self):
-        """ Initialize the weights."""
+        """Initialize the weights."""
+
         def re_init(module):
             if isinstance(module, (nn.Linear, nn.Embedding)):
                 # Slightly different from the TF version which uses truncated_normal for initialization
@@ -147,7 +171,7 @@ class CHDL(nn.Module):
         self.apply(re_init)
 
     def set_hard_negative(self, use_hard_negative, hard_pool_size):
-        """use_hard_negative: bool; hard_pool_size: int, """
+        """use_hard_negative: bool; hard_pool_size: int,"""
         self.config.use_hard_negative = use_hard_negative
         self.config.hard_pool_size = hard_pool_size
 
@@ -155,7 +179,17 @@ class CHDL(nn.Module):
         """pre-train video retrieval then span prediction"""
         self.config.lw_st_ed = lw_st_ed
 
-    def forward(self, query_feat, query_mask, video_feat, video_mask, st_ed_indices, match_labels, sub_feat=None, sub_mask=None):
+    def forward(
+        self,
+        query_feat,
+        query_mask,
+        video_feat,
+        video_mask,
+        st_ed_indices,
+        match_labels,
+        sub_feat=None,
+        sub_mask=None,
+    ):
         """
         Args:
             query_feat: (N, Lq, Dq)
@@ -167,15 +201,38 @@ class CHDL(nn.Module):
             st_ed_indices: (N, 2), torch.LongTensor, 1st, 2nd columns are st, ed labels respectively.
             match_labels: (N, Lv), torch.LongTensor, matching labels for detecting foreground and background (not used)
         """
-            
-        video_feat, sub_feat, mid_x_video_feat, mid_x_sub_feat, x_video_feat, x_sub_feat = self.encode_context(
-            video_feat, video_mask, sub_feat, sub_mask, return_mid_output=True)
+
+        (
+            video_feat,
+            sub_feat,
+            mid_x_video_feat,
+            mid_x_sub_feat,
+            x_video_feat,
+            x_sub_feat,
+        ) = self.encode_context(
+            video_feat, video_mask, sub_feat, sub_mask, return_mid_output=True
+        )
 
         # x_video_feat_hashed = self.hash1(x_video_feat, self.eta)
         # x_sub_feat_hashed = self.hash1(x_sub_feat, self.eta)
-        video_query, sub_query, encoded_query, query_context_scores, st_prob, ed_prob, reg_loss = self.get_pred_from_raw_query(
-            query_feat, query_mask, x_video_feat, video_mask, x_sub_feat, sub_mask, cross=False,
-            return_query_feats=True)
+        (
+            video_query,
+            sub_query,
+            encoded_query,
+            query_context_scores,
+            st_prob,
+            ed_prob,
+            reg_loss,
+        ) = self.get_pred_from_raw_query(
+            query_feat,
+            query_mask,
+            x_video_feat,
+            video_mask,
+            x_sub_feat,
+            sub_mask,
+            cross=False,
+            return_query_feats=True,
+        )
 
         # frame level contrastive learning loss (FrameCL)
         loss_fcl = 0
@@ -188,13 +245,13 @@ class CHDL(nn.Module):
             # 获取查询的token表示（而不是单一的查询向量）
             # encoded_query = self.encode_input(query_feat, query_mask, self.query_input_proj, self.query_encoder, self.query_pos_embed)
             # encoded_query = self.query_encoder1(encoded_query, query_mask.unsqueeze(1))  # (N, Lq, D)
-            
+
             # 视频模态的token-frame对比学习
             loss_fcl_vq = batch_local_token_frame_loss(
                 x_video_feat, encoded_query, match_labels, video_mask, query_mask
             )
-            
-            # 字幕模态的token-frame对比学习 
+
+            # 字幕模态的token-frame对比学习
             if x_sub_feat is not None:
                 loss_fcl_sq = batch_local_token_frame_loss(
                     x_sub_feat, encoded_query, match_labels, sub_mask, query_mask
@@ -203,38 +260,43 @@ class CHDL(nn.Module):
             else:
                 loss_fcl = loss_fcl_vq
             loss_fcl = self.config.lw_fcl * loss_fcl
-        
-            
+
         # video level contrastive learning loss (VideoCL)
         loss_vcl = 0
         if self.config.lw_vcl != 0:
-            mid_video_q2ctx_scores = self.get_unnormalized_video_level_scores(video_query, x_video_feat, video_mask)
+            mid_video_q2ctx_scores = self.get_unnormalized_video_level_scores(
+                video_query, x_video_feat, video_mask
+            )
             mid_video_q2ctx_scores, _ = torch.max(mid_video_q2ctx_scores, dim=1)
             if sub_feat is not None:
-                mid_sub_q2ctx_scores = self.get_unnormalized_video_level_scores(sub_query, x_sub_feat, sub_mask)
+                mid_sub_q2ctx_scores = self.get_unnormalized_video_level_scores(
+                    sub_query, x_sub_feat, sub_mask
+                )
                 mid_sub_q2ctx_scores, _ = torch.max(mid_sub_q2ctx_scores, dim=1)
                 mid_q2ctx_scores = (mid_video_q2ctx_scores + mid_sub_q2ctx_scores) / 2.0
             else:
                 mid_q2ctx_scores = mid_video_q2ctx_scores
             loss_vcl = self.nce_criterion(mid_q2ctx_scores)
             loss_vcl = self.config.lw_vcl * loss_vcl
-            
-            
+
         # moment localization loss
         loss_st_ed = 0
         if self.config.lw_st_ed != 0:
             # Clean st_prob and ed_prob before CrossEntropyLoss
-            st_prob_clean = torch.nan_to_num(st_prob, nan=0.0, posinf=50.0, neginf=-50.0)
-            ed_prob_clean = torch.nan_to_num(ed_prob, nan=0.0, posinf=50.0, neginf=-50.0)
+            st_prob_clean = torch.nan_to_num(
+                st_prob, nan=0.0, posinf=50.0, neginf=-50.0
+            )
+            ed_prob_clean = torch.nan_to_num(
+                ed_prob, nan=0.0, posinf=50.0, neginf=-50.0
+            )
             st_prob_clean = torch.clamp(st_prob_clean, min=-50.0, max=50.0)
             ed_prob_clean = torch.clamp(ed_prob_clean, min=-50.0, max=50.0)
-            
+
             loss_st = self.temporal_criterion(st_prob_clean, st_ed_indices[:, 0])
             loss_ed = self.temporal_criterion(ed_prob_clean, st_ed_indices[:, 1])
             loss_st_ed = loss_st + loss_ed
             loss_st_ed = self.config.lw_st_ed * loss_st_ed
-            
-            
+
         # video level retrieval loss
         loss_neg_ctx, loss_neg_q = 0, 0
         if self.config.lw_neg_ctx != 0 or self.config.lw_neg_q != 0:
@@ -245,7 +307,7 @@ class CHDL(nn.Module):
         loss_L_q = reg_loss["L_q"] * self.config.lw_q
         loss_L_b = reg_loss["L_b"] * self.config.lw_b
         loss_L_r = reg_loss["L_r"] * self.config.lw_rec
-        
+
         # Clean all loss components before summation
         param = next(self.parameters())
         if not isinstance(loss_fcl, torch.Tensor):
@@ -260,29 +322,53 @@ class CHDL(nn.Module):
         loss_L_b = torch.nan_to_num(loss_L_b, nan=0.0, posinf=1e6, neginf=-1e6)
         loss_L_q = torch.nan_to_num(loss_L_q, nan=0.0, posinf=1e6, neginf=-1e6)
         loss_L_r = torch.nan_to_num(loss_L_r, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        loss = loss_fcl + loss_vcl + loss_st_ed + loss_neg_ctx + loss_neg_q + loss_L_b + loss_L_q + loss_L_r
+
+        loss = (
+            loss_fcl
+            + loss_vcl
+            + loss_st_ed
+            + loss_neg_ctx
+            + loss_neg_q
+            + loss_L_b
+            + loss_L_q
+            + loss_L_r
+        )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=-1e6)
-        
+
         self._epoch += 1
         # Clamp eta to prevent it from growing too large
         self.eta = min(math.pow((1.0 * self._epoch + 1.0), 0.5), 10.0)
-        
-        return loss, {"loss_st_ed": float(loss_st_ed), "loss_fcl": float(loss_fcl), 
-                      "loss_vcl": loss_vcl, "loss_neg_ctx": float(loss_neg_ctx), 
-                      "loss_neg_q": float(loss_neg_q), "loss_L_b": float(loss_L_b),
-                      "loss_L_q": float(loss_L_q), "loss_L_r": float(loss_L_r),
-                      "loss_overall": float(loss)}
+
+        return loss, {
+            "loss_st_ed": float(loss_st_ed),
+            "loss_fcl": float(loss_fcl),
+            "loss_vcl": loss_vcl,
+            "loss_neg_ctx": float(loss_neg_ctx),
+            "loss_neg_q": float(loss_neg_q),
+            "loss_L_b": float(loss_L_b),
+            "loss_L_q": float(loss_L_q),
+            "loss_L_r": float(loss_L_r),
+            "loss_overall": float(loss),
+        }
 
     def encode_query(self, query_feat, query_mask):
-        encoded_query = self.encode_input(query_feat, query_mask, self.query_input_proj, self.query_encoder,
-                                          self.query_pos_embed)  # (N, Lq, D)
+        encoded_query = self.encode_input(
+            query_feat,
+            query_mask,
+            self.query_input_proj,
+            self.query_encoder,
+            self.query_pos_embed,
+        )  # (N, Lq, D)
         encoded_query = self.query_encoder1(encoded_query, query_mask.unsqueeze(1))
-        video_query, sub_query = self.get_modularized_queries(encoded_query, query_mask)  # (N, D) * 2
+        video_query, sub_query = self.get_modularized_queries(
+            encoded_query, query_mask
+        )  # (N, D) * 2
         return video_query, sub_query, encoded_query
 
-    def encode_context(self, video_feat, video_mask, sub_feat, sub_mask, return_mid_output=False):
-        '''
+    def encode_context(
+        self, video_feat, video_mask, sub_feat, sub_mask, return_mid_output=False
+    ):
+        """
         Retunrns:
                 encoded_video_feat: 添加位置编码后的特征
                 ncoded_sub_feat: 添加位置编码后的特征
@@ -290,37 +376,83 @@ class CHDL(nn.Module):
                 x_encoded_sub_feat_: H_s^'
                 x_encoded_video_feat: H_v
                 x_encoded_sub_feat): H_s
-            
-        '''
+
+        """
         # encoding video and subtitle features, respectively
-        encoded_video_feat = self.encode_input(video_feat, video_mask, self.video_input_proj, self.video_encoder1,self.ctx_pos_embed)
+        encoded_video_feat = self.encode_input(
+            video_feat,
+            video_mask,
+            self.video_input_proj,
+            self.video_encoder1,
+            self.ctx_pos_embed,
+        )
         x_encoded_video_feat = encoded_video_feat
         if sub_feat is not None:
-            encoded_sub_feat = self.encode_input(sub_feat, sub_mask, self.sub_input_proj, self.sub_encoder1, self.ctx_pos_embed)
+            encoded_sub_feat = self.encode_input(
+                sub_feat,
+                sub_mask,
+                self.sub_input_proj,
+                self.sub_encoder1,
+                self.ctx_pos_embed,
+            )
             # cross encoding subtitle features
-            x_encoded_video_feat = self.cross_context_encoder(encoded_video_feat, video_mask, encoded_sub_feat, sub_mask, self.video_cross_att, self.video_cross_layernorm)  # (N, L, D)
+            x_encoded_video_feat = self.cross_context_encoder(
+                encoded_video_feat,
+                video_mask,
+                encoded_sub_feat,
+                sub_mask,
+                self.video_cross_att,
+                self.video_cross_layernorm,
+            )  # (N, L, D)
         else:
             encoded_sub_feat = None
-        x_encoded_video_feat_ = self.video_encoder2(x_encoded_video_feat, video_mask.unsqueeze(1))
+        x_encoded_video_feat_ = self.video_encoder2(
+            x_encoded_video_feat, video_mask.unsqueeze(1)
+        )
         # cross encoding video features
         if sub_feat is not None:
-            x_encoded_sub_feat = self.cross_context_encoder(encoded_sub_feat, sub_mask, encoded_video_feat, video_mask, self.sub_cross_att, self.sub_cross_layernorm)  # (N, L, D)
-            x_encoded_sub_feat_ = self.sub_encoder2(x_encoded_sub_feat, sub_mask.unsqueeze(1))
+            x_encoded_sub_feat = self.cross_context_encoder(
+                encoded_sub_feat,
+                sub_mask,
+                encoded_video_feat,
+                video_mask,
+                self.sub_cross_att,
+                self.sub_cross_layernorm,
+            )  # (N, L, D)
+            x_encoded_sub_feat_ = self.sub_encoder2(
+                x_encoded_sub_feat, sub_mask.unsqueeze(1)
+            )
             # additional self encoding process
-            x_encoded_video_feat = self.video_encoder3(x_encoded_video_feat_, video_mask.unsqueeze(1))
-            x_encoded_sub_feat = self.sub_encoder3(x_encoded_sub_feat_, sub_mask.unsqueeze(1))
+            x_encoded_video_feat = self.video_encoder3(
+                x_encoded_video_feat_, video_mask.unsqueeze(1)
+            )
+            x_encoded_sub_feat = self.sub_encoder3(
+                x_encoded_sub_feat_, sub_mask.unsqueeze(1)
+            )
         else:
             x_encoded_sub_feat_ = None
             x_encoded_sub_feat = None
         if return_mid_output:
-            return (encoded_video_feat, encoded_sub_feat, x_encoded_video_feat_, x_encoded_sub_feat_,
-                    x_encoded_video_feat, x_encoded_sub_feat)
+            return (
+                encoded_video_feat,
+                encoded_sub_feat,
+                x_encoded_video_feat_,
+                x_encoded_sub_feat_,
+                x_encoded_video_feat,
+                x_encoded_sub_feat,
+            )
         else:
             return x_encoded_video_feat, x_encoded_sub_feat
 
     @staticmethod
-    def cross_context_encoder(main_context_feat, main_context_mask, side_context_feat, side_context_mask,
-                              cross_att_layer, norm_layer):
+    def cross_context_encoder(
+        main_context_feat,
+        main_context_mask,
+        side_context_feat,
+        side_context_mask,
+        cross_att_layer,
+        norm_layer,
+    ):
         """
         Args:
             main_context_feat: (N, Lq, D)
@@ -330,8 +462,12 @@ class CHDL(nn.Module):
             cross_att_layer: cross attention layer
             norm_layer: layer norm layer
         """
-        cross_mask = torch.einsum("bm,bn->bmn", main_context_mask, side_context_mask)  # (N, Lq, Lk)
-        cross_out = cross_att_layer(main_context_feat, side_context_feat, side_context_feat, cross_mask)  # (N, Lq, D)
+        cross_mask = torch.einsum(
+            "bm,bn->bmn", main_context_mask, side_context_mask
+        )  # (N, Lq, Lk)
+        cross_out = cross_att_layer(
+            main_context_feat, side_context_feat, side_context_feat, cross_mask
+        )  # (N, Lq, D)
         residual_out = norm_layer(cross_out + main_context_feat)
         return residual_out
 
@@ -350,22 +486,35 @@ class CHDL(nn.Module):
         mask = mask.unsqueeze(1)  # (N, 1, L), torch.FloatTensor
         return encoder_layer(feat, mask)  # (N, L, D_hidden)
 
-    def get_modularized_queries(self, encoded_query, query_mask, return_modular_att=False):
+    def get_modularized_queries(
+        self, encoded_query, query_mask, return_modular_att=False
+    ):
         """
         Args:
             encoded_query: (N, L, D)
             query_mask: (N, L)
             return_modular_att: bool
         """
-        modular_attention_scores = self.modular_vector_mapping(encoded_query)  # (N, L, 2 or 1)
-        modular_attention_scores = F.softmax(mask_logits(modular_attention_scores, query_mask.unsqueeze(2)), dim=1)
-        modular_queries = torch.einsum("blm,bld->bmd", modular_attention_scores, encoded_query)  # (N, 2 or 1, D)
+        modular_attention_scores = self.modular_vector_mapping(
+            encoded_query
+        )  # (N, L, 2 or 1)
+        modular_attention_scores = F.softmax(
+            mask_logits(modular_attention_scores, query_mask.unsqueeze(2)), dim=1
+        )
+        modular_queries = torch.einsum(
+            "blm,bld->bmd", modular_attention_scores, encoded_query
+        )  # (N, 2 or 1, D)
         if return_modular_att:
             assert modular_queries.shape[1] == 2
-            return modular_queries[:, 0], modular_queries[:, 1], modular_attention_scores
+            return (
+                modular_queries[:, 0],
+                modular_queries[:, 1],
+                modular_attention_scores,
+            )
         else:
             assert modular_queries.shape[1] == 2
             return modular_queries[:, 0], modular_queries[:, 1]  # (N, D) * 2
+
     @staticmethod
     def _binarize_pm1(x: torch.Tensor) -> torch.Tensor:
         # sign(0) = 0 会带来零位；这里把 0 也当作 +1 以避免稀疏
@@ -377,11 +526,13 @@ class CHDL(nn.Module):
         # Numerically stable version: log(cosh(x)) = |x| + log(1 + exp(-2|x|))
         abs_x = torch.abs(x)
         # Clamp to prevent overflow in exp(-2*abs_x)
-        abs_x_clamped = torch.clamp(abs_x, max=20.0)  
+        abs_x_clamped = torch.clamp(abs_x, max=20.0)
         return abs_x_clamped + torch.log1p(torch.exp(-2.0 * abs_x_clamped))
 
     @staticmethod
-    def hash_regularizers(B: torch.Tensor, smooth_abs: bool = True, reduction: str = "mean"):
+    def hash_regularizers(
+        B: torch.Tensor, smooth_abs: bool = True, reduction: str = "mean"
+    ):
         """
         B: (N, l)  某层的哈希码（训练时用 bin_like；评估时若要记录数值可用 sign(code)）
         return: L_q, L_b  两个标量
@@ -392,8 +543,8 @@ class CHDL(nn.Module):
         L_q = lq_map.mean() if reduction == "mean" else lq_map.sum()
 
         # L_b ：让各位在 batch 内均值为 0
-        bit_means = B.mean(dim=0)         # (l,)
-        L_b = (bit_means ** 2).mean()     # 标量
+        bit_means = B.mean(dim=0)  # (l,)
+        L_b = (bit_means**2).mean()  # 标量
         return L_q, L_b
 
     # @staticmethod
@@ -423,11 +574,10 @@ class CHDL(nn.Module):
     #         Bc = torch.sign(hv_c.code).view(N, L, -1)           # (N·L, Dh)
     #         Dh = Bc.size(-1)
     #         scores = torch.einsum("md,nld->mln", Bq, Bc) / max(Dh, 1e-6)
-            
+
     #     cm = context_mask.transpose(0, 1).unsqueeze(0)  # (1, L, N)
     #     scores = mask_logits(scores, cm).max(dim=1).values  # (N, N)
     #     scores = torch.nan_to_num(scores, nan=-1e4, posinf=1e4, neginf=-1e4)
-
 
     #     # 两个正则：对 query 与 context 各算一遍后相加
     #     Lq_q, Lb_q, Lr_q = hash_layer.regularizers(modularied_query)
@@ -436,7 +586,9 @@ class CHDL(nn.Module):
     #     return scores, reg
 
     @staticmethod
-    def get_video_level_scores(modularied_query, context_feat, context_mask, hash_layer=None, epoch=None):
+    def get_video_level_scores(
+        modularied_query, context_feat, context_mask, hash_layer=None, epoch=None
+    ):
         """
         支持通用形状：
         modularied_query: HashedVector（来自 self.hash2(...)），形状 (Nq, Dh)
@@ -457,8 +609,8 @@ class CHDL(nn.Module):
             Dh = modularied_query.code.shape[1]
 
         # 展平上下文后过 hash 层
-        context_feat_flat = context_feat.reshape(Nc * L, Dc)    # (Nc*L, D)
-        hv_c = hash_layer(context_feat_flat, epoch)              # HashedVector
+        context_feat_flat = context_feat.reshape(Nc * L, Dc)  # (Nc*L, D)
+        hv_c = hash_layer(context_feat_flat, epoch)  # HashedVector
         reg = {"L_q": 0.0, "L_b": 0.0, "L_r": 0.0}
         # 正则项（保持你原来的做法不变）
         if hash_layer.training:
@@ -468,37 +620,42 @@ class CHDL(nn.Module):
 
         if hash_layer.training:
             # ====== 浮点可导路径（训练）======
-            Bq = F.normalize(modularied_query.bin_like, dim=-1, eps=1e-6)         # (Nq, Dh)
-            Bc = F.normalize(hv_c.bin_like, dim=-1, eps=1e-6).view(Nc, L, -1)     # (Nc, L, Dh)
+            Bq = F.normalize(modularied_query.bin_like, dim=-1, eps=1e-6)  # (Nq, Dh)
+            Bc = F.normalize(hv_c.bin_like, dim=-1, eps=1e-6).view(
+                Nc, L, -1
+            )  # (Nc, L, Dh)
             # 先算 (Nq, Nc, L)，再转成 (Nq, L, Nc) 以便随后按 L 维做 max
-            sims_qnl = torch.einsum("qd,nld->qnl", Bq, Bc)                        # (Nq, Nc, L)
-            sims_mln = sims_qnl.permute(0, 2, 1).contiguous()                      # (Nq, L, Nc)
+            sims_qnl = torch.einsum("qd,nld->qnl", Bq, Bc)  # (Nq, Nc, L)
+            sims_mln = sims_qnl.permute(0, 2, 1).contiguous()  # (Nq, L, Nc)
         else:
             # ====== 位运算（推理）：XNOR + popcount + 线性缩放回余弦 ======
             # 生成 0/1 位并打包
-            Bq01 = (modularied_query.bin_like > 0).to(torch.uint8)                 # (Nq, Dh)
-            Bc01 = (hv_c.bin_like > 0).to(torch.uint8)                             # (Nc*L, Dh)
-            Bq_packed = hash_layer._pack_bits(Bq01)                                # (Nq,   nbytes)
-            Bc_packed = hash_layer._pack_bits(Bc01)                                # (Nc*L, nbytes)
+            Bq01 = (modularied_query.bin_like > 0).to(torch.uint8)  # (Nq, Dh)
+            Bc01 = (hv_c.bin_like > 0).to(torch.uint8)  # (Nc*L, Dh)
+            Bq_packed = hash_layer._pack_bits(Bq01)  # (Nq,   nbytes)
+            Bc_packed = hash_layer._pack_bits(Bc01)  # (Nc*L, nbytes)
 
-            matches = hash_layer.xnor_popcount(Bq_packed, Bc_packed)               # (Nq, Nc*L) int32
+            matches = hash_layer.xnor_popcount(Bq_packed, Bc_packed)  # (Nq, Nc*L) int32
 
-            sims = (2.0 * matches.to(torch.float32) - float(Dh)) / float(Dh)       # (Nq, Nc*L)
-            sims_qnl = sims.view(Nq, Nc, L)                                        # (Nq, Nc, L)
-            sims_mln = sims_qnl.permute(0, 2, 1).contiguous()                       # (Nq, L, Nc)
+            sims = (2.0 * matches.to(torch.float32) - float(Dh)) / float(
+                Dh
+            )  # (Nq, Nc*L)
+            sims_qnl = sims.view(Nq, Nc, L)  # (Nq, Nc, L)
+            sims_mln = sims_qnl.permute(0, 2, 1).contiguous()  # (Nq, L, Nc)
 
         # 掩码与归约（与原逻辑一致）
-        cm = context_mask.transpose(0, 1).unsqueeze(0)                              # (1, L, Nc)
-        sims_mln = mask_logits(sims_mln, cm)                                       # (Nq, L, Nc)
-        scores = sims_mln.max(dim=1).values                                        # (Nq, Nc)
+        cm = context_mask.transpose(0, 1).unsqueeze(0)  # (1, L, Nc)
+        sims_mln = mask_logits(sims_mln, cm)  # (Nq, L, Nc)
+        scores = sims_mln.max(dim=1).values  # (Nq, Nc)
 
         scores = torch.nan_to_num(scores, nan=-1e4, posinf=1e4, neginf=-1e4)
         return scores, reg
-    
 
     @staticmethod
-    def get_unnormalized_video_level_scores(modularied_query, context_feat, context_mask):
-        """ Calculate video2query scores for each pair of video and query inside the batch.
+    def get_unnormalized_video_level_scores(
+        modularied_query, context_feat, context_mask
+    ):
+        """Calculate video2query scores for each pair of video and query inside the batch.
         Args:
             modularied_query: (N, D)
             context_feat: (N, L, D), output of the first transformer encoder layer
@@ -507,22 +664,34 @@ class CHDL(nn.Module):
             context_query_scores: (N, N)  score of each query w.r.t. each video inside the batch,
                 diagonal positions are positive. used to get negative samples.
         """
-        query_context_scores = torch.einsum("md,nld->mln", modularied_query, context_feat)  # (N, L, N)
+        query_context_scores = torch.einsum(
+            "md,nld->mln", modularied_query, context_feat
+        )  # (N, L, N)
         context_mask = context_mask.transpose(0, 1).unsqueeze(0)  # (1, L, N)
-        query_context_scores = mask_logits(query_context_scores, context_mask)  # (N, L, N)
+        query_context_scores = mask_logits(
+            query_context_scores, context_mask
+        )  # (N, L, N)
         return query_context_scores
 
-    def get_merged_score(self, video_query, video_feat, sub_query, sub_feat, cross=False):
+    def get_merged_score(
+        self, video_query, video_feat, sub_query, sub_feat, cross=False
+    ):
         if sub_query is not None:
             video_query = self.video_query_linear(video_query)
             sub_query = self.sub_query_linear(sub_query)
             if cross:
                 video_similarity = torch.einsum("md,nld->mnl", video_query, video_feat)
                 sub_similarity = torch.einsum("md,nld->mnl", sub_query, sub_feat)
-                similarity = (video_similarity + sub_similarity) / 2  # (Nq, Nv, L)  from query to all videos.
+                similarity = (
+                    video_similarity + sub_similarity
+                ) / 2  # (Nq, Nv, L)  from query to all videos.
             else:
-                video_similarity = torch.einsum("bd,bld->bl", video_query, video_feat)  # (N, L)
-                sub_similarity = torch.einsum("bd,bld->bl", sub_query, sub_feat)  # (N, L)
+                video_similarity = torch.einsum(
+                    "bd,bld->bl", video_query, video_feat
+                )  # (N, L)
+                sub_similarity = torch.einsum(
+                    "bd,bld->bl", sub_query, sub_feat
+                )  # (N, L)
                 similarity = (video_similarity + sub_similarity) / 2
             return similarity
         else:
@@ -531,7 +700,9 @@ class CHDL(nn.Module):
                 video_similarity = torch.einsum("md,nld->mnl", video_query, video_feat)
                 similarity = video_similarity
             else:
-                video_similarity = torch.einsum("bd,bld->bl", video_query, video_feat)  # (N, L)
+                video_similarity = torch.einsum(
+                    "bd,bld->bl", video_query, video_feat
+                )  # (N, L)
                 similarity = video_similarity
             return similarity
 
@@ -550,10 +721,10 @@ class CHDL(nn.Module):
 
     def get_merged_st_ed_prob(self, similarity, context_mask, cross=False):
         if cross:
-            n_q, n_c, length = similarity.shape           # (Nq, Nv, L)
+            n_q, n_c, length = similarity.shape  # (Nq, Nv, L)
             flat = similarity.reshape(n_q * n_c, length)  # (Nq*Nv, L)
-            st_prob = self.merged_st_predictor(flat)      # (Nq*Nv, L)
-            ed_prob = self.merged_ed_predictor(flat)      # (Nq*Nv, L)
+            st_prob = self.merged_st_predictor(flat)  # (Nq*Nv, L)
+            ed_prob = self.merged_ed_predictor(flat)  # (Nq*Nv, L)
             st_prob = st_prob.view(n_q, n_c, length)
             ed_prob = ed_prob.view(n_q, n_c, length)
             # context_mask 这里应为 (Nq,Nv,L)；若当前只有 (Nv,L) 或 (N,L)，需在上游对齐
@@ -568,26 +739,38 @@ class CHDL(nn.Module):
             ed_prob = mask_logits(ed_prob, context_mask)
             return st_prob, ed_prob
 
-    def get_pred_from_raw_query(self, query_feat, query_mask,
-                            video_feat, video_mask,
-                            sub_feat, sub_mask,
-                            cross=False, return_query_feats=False, timing_dict=None):
+    def get_pred_from_raw_query(
+        self,
+        query_feat,
+        query_mask,
+        video_feat,
+        video_mask,
+        sub_feat,
+        sub_mask,
+        cross=False,
+        return_query_feats=False,
+        timing_dict=None,
+    ):
         """
         sub_feat/sub_mask 可以为 None。无字幕时仅用 video 分支。
         """
-        do_time = (timing_dict is not None)
+        do_time = timing_dict is not None
 
         if do_time:
             _sync_if_cuda(query_feat)
             t0_q_enc = perf_counter()
 
         # 1) 编码 query
-        video_query, sub_query, encoded_query = self.encode_query(query_feat, query_mask)
+        video_query, sub_query, encoded_query = self.encode_query(
+            query_feat, query_mask
+        )
 
         if do_time:
             _sync_if_cuda(video_query)
             # 累积到外部字典
-            timing_dict["query_enc_s"] = timing_dict.get("query_enc_s", 0.0) + (perf_counter() - t0_q_enc)
+            timing_dict["query_enc_s"] = timing_dict.get("query_enc_s", 0.0) + (
+                perf_counter() - t0_q_enc
+            )
 
         if do_time:
             t0_vr = perf_counter()
@@ -599,9 +782,11 @@ class CHDL(nn.Module):
         )
 
         # 3) 决定是否启用字幕分支
-        use_sub_now = (getattr(self, "use_sub", True)
-                    and (sub_feat is not None)
-                    and (sub_mask is not None))
+        use_sub_now = (
+            getattr(self, "use_sub", True)
+            and (sub_feat is not None)
+            and (sub_mask is not None)
+        )
 
         if use_sub_now:
             sub_query_h = self.hash2(sub_query, self.eta)
@@ -623,19 +808,31 @@ class CHDL(nn.Module):
         if do_time:
             _sync_if_cuda(q2ctx_scores)
             # 累积到外部字典
-            timing_dict["vr_score_calc_s"] = timing_dict.get("vr_score_calc_s", 0.0) + (perf_counter() - t0_vr)
+            timing_dict["vr_score_calc_s"] = timing_dict.get("vr_score_calc_s", 0.0) + (
+                perf_counter() - t0_vr
+            )
 
         if do_time:
             t0_mr = perf_counter()
 
         # # 4) 起止概率：无字幕时仅用 video 相似度
-        similarity = self.get_merged_score(video_query, video_feat, sub_query if use_sub_now else None, sub_feat if use_sub_now else None, cross=cross)
-        st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, video_mask, cross=cross)
+        similarity = self.get_merged_score(
+            video_query,
+            video_feat,
+            sub_query if use_sub_now else None,
+            sub_feat if use_sub_now else None,
+            cross=cross,
+        )
+        st_prob, ed_prob = self.get_merged_st_ed_prob(
+            similarity, video_mask, cross=cross
+        )
 
         if do_time:
             _sync_if_cuda(st_prob)
             # 累积到外部字典
-            timing_dict["mr_prob_calc_s"] = timing_dict.get("mr_prob_calc_s", 0.0) + (perf_counter() - t0_mr)
+            timing_dict["mr_prob_calc_s"] = timing_dict.get("mr_prob_calc_s", 0.0) + (
+                perf_counter() - t0_mr
+            )
 
         # pairwise = (video_feat.size(0) != encoded_query.size(0))
         # st_prob, ed_prob = self.moment(
@@ -646,13 +843,20 @@ class CHDL(nn.Module):
         # )
 
         if return_query_feats:
-            return video_query, sub_query, encoded_query, q2ctx_scores, st_prob, ed_prob, reg
+            return (
+                video_query,
+                sub_query,
+                encoded_query,
+                q2ctx_scores,
+                st_prob,
+                ed_prob,
+                reg,
+            )
         else:
             return q2ctx_scores, st_prob, ed_prob
 
-
     def get_video_level_loss(self, query_context_scores):
-        """ ranking loss between (pos. query + pos. video) and (pos. query + neg. video) or (neg. query + pos. video)
+        """ranking loss between (pos. query + pos. video) and (pos. query + neg. video) or (neg. query + pos. video)
         Args:
             query_context_scores: (N, N), cosine similarity [-1, 1],
                 Each row contains the scores between the query to each of the videos inside the batch.
@@ -663,8 +867,13 @@ class CHDL(nn.Module):
         query_context_scores_masked = copy.deepcopy(query_context_scores.data)
         # impossibly large for cosine similarity, the copy is created as modifying the original will cause error
         query_context_scores_masked[diagonal_indices, diagonal_indices] = 999
-        pos_query_neg_context_scores = self.get_neg_scores(query_context_scores, query_context_scores_masked)
-        neg_query_pos_context_scores = self.get_neg_scores(query_context_scores.transpose(0, 1), query_context_scores_masked.transpose(0, 1))
+        pos_query_neg_context_scores = self.get_neg_scores(
+            query_context_scores, query_context_scores_masked
+        )
+        neg_query_pos_context_scores = self.get_neg_scores(
+            query_context_scores.transpose(0, 1),
+            query_context_scores_masked.transpose(0, 1),
+        )
         loss_neg_ctx = self.get_ranking_loss(pos_scores, pos_query_neg_context_scores)
         loss_neg_q = self.get_ranking_loss(pos_scores, neg_query_pos_context_scores)
         return loss_neg_ctx, loss_neg_q
@@ -680,20 +889,31 @@ class CHDL(nn.Module):
         batch_indices = torch.arange(bsz).to(scores.device)
         _, sorted_scores_indices = torch.sort(scores_masked, descending=True, dim=1)
         sample_min_idx = 1  # skip the masked positive
-        sample_max_idx = min(sample_min_idx + self.config.hard_pool_size, bsz) if self.config.use_hard_negative else bsz
+        sample_max_idx = (
+            min(sample_min_idx + self.config.hard_pool_size, bsz)
+            if self.config.use_hard_negative
+            else bsz
+        )
         # (N, )
-        sampled_neg_score_indices = sorted_scores_indices[batch_indices, torch.randint(sample_min_idx, sample_max_idx, size=(bsz,)).to(scores.device)]
+        sampled_neg_score_indices = sorted_scores_indices[
+            batch_indices,
+            torch.randint(sample_min_idx, sample_max_idx, size=(bsz,)).to(
+                scores.device
+            ),
+        ]
         sampled_neg_scores = scores[batch_indices, sampled_neg_score_indices]  # (N, )
         return sampled_neg_scores
 
     def get_ranking_loss(self, pos_score, neg_score):
-        """ Note here we encourage positive scores to be larger than negative scores.
+        """Note here we encourage positive scores to be larger than negative scores.
         Args:
             pos_score: (N, ), torch.float32
             neg_score: (N, ), torch.float32
         """
         if self.config.ranking_loss_type == "hinge":  # max(0, m + S_neg - S_pos)
-            return torch.clamp(self.config.margin + neg_score - pos_score, min=0).sum() / len(pos_score)
+            return torch.clamp(
+                self.config.margin + neg_score - pos_score, min=0
+            ).sum() / len(pos_score)
         elif self.config.ranking_loss_type == "lse":  # log[1 + exp(S_neg - S_pos)]
             return torch.log1p(torch.exp(neg_score - pos_score)).sum() / len(pos_score)
         else:
@@ -707,24 +927,26 @@ class CHDL(nn.Module):
         """
         self.eval()
         # 1. 编码查询
-        video_query, sub_query, encoded_query = self.encode_query(query_feat, query_mask) # (Nq, D)
-        
+        video_query, sub_query, encoded_query = self.encode_query(
+            query_feat, query_mask
+        )  # (Nq, D)
+
         # 2. 哈希查询 (hash2)
         # 2.1 视频查询 (Video Query)
         # 调用 hash2.forward() 获取 HashedVector
-        hv_q_vid = self.hash2(video_query, self.eta, export_packed=False) # (Nq, D)
+        hv_q_vid = self.hash2(video_query, self.eta, export_packed=False)  # (Nq, D)
         # 精确复现: (bin_like > 0)
         # hv_q_vid.bin_like 在 eval 模式下是 torch.sign(code)
-        bits01_vid = (hv_q_vid.bin_like > 0).to(torch.uint8) 
+        bits01_vid = (hv_q_vid.bin_like > 0).to(torch.uint8)
         packed_q_vid = self.hash2._pack_bits(bits01_vid)
 
         # 2.2 字幕查询 (Sub Query)
         packed_q_sub = None
         if self.config.ctx_mode == "video_sub":
-             hv_q_sub = self.hash2(sub_query, self.eta, export_packed=False)
-             # 精确复现: (bin_like > 0)
-             bits01_sub = (hv_q_sub.bin_like > 0).to(torch.uint8)
-             packed_q_sub = self.hash2._pack_bits(bits01_sub)
+            hv_q_sub = self.hash2(sub_query, self.eta, export_packed=False)
+            # 精确复现: (bin_like > 0)
+            bits01_sub = (hv_q_sub.bin_like > 0).to(torch.uint8)
+            packed_q_sub = self.hash2._pack_bits(bits01_sub)
 
         # 返回VR用的打包哈希码，和MR用的密集查询特征
         return packed_q_vid, packed_q_sub, video_query, sub_query
@@ -740,10 +962,10 @@ class CHDL(nn.Module):
         # 确保你已经应用了上一轮的修复 (return_mid_output=True)
         _, _, _, _, x_video_feat, x_sub_feat = self.encode_context(
             video_feat, video_mask, sub_feat, sub_mask, return_mid_output=True
-        ) # (Nc, L, D)
+        )  # (Nc, L, D)
 
         Nc, L, D = x_video_feat.shape
-        
+
         # 2. 为VR创建哈希索引 (hash1)
         # 2.1 视频哈希 (Video Hash)
         video_frames_flat = x_video_feat.reshape(Nc * L, D)
@@ -756,106 +978,132 @@ class CHDL(nn.Module):
 
         # 2.2 字幕哈希 (Sub Hash)
         packed_bits_sub = None
-        use_sub = (sub_feat is not None and x_sub_feat is not None)
+        use_sub = sub_feat is not None and x_sub_feat is not None
         if use_sub:
             sub_frames_flat = x_sub_feat.reshape(Nc * L, D)
             hv_c_sub = self.hash1(sub_frames_flat, self.eta, export_packed=False)
             # 精确复现: (bin_like >= 0)
             bits01_sub = (hv_c_sub.bin_like >= 0).to(torch.uint8)
             packed_bits_sub = self.hash1._pack_bits(bits01_sub)
-        
+
         # 3. 返回所有需要的数据
         indexed_data = {
-            "vr_video_hash": packed_bits_vid, # (Nc*L, nbytes)
-            "vr_sub_hash": packed_bits_sub,   # (Nc*L, nbytes) or None
-            "mr_video_feat": x_video_feat,    # (Nc, L, D) - MR的密集特征
-            "mr_sub_feat": x_sub_feat,      # (Nc, L, D) or None
-            "video_mask": video_mask,       # (Nc, L)
+            "vr_video_hash": packed_bits_vid,  # (Nc*L, nbytes)
+            "vr_sub_hash": packed_bits_sub,  # (Nc*L, nbytes) or None
+            "mr_video_feat": x_video_feat,  # (Nc, L, D) - MR的密集特征
+            "mr_sub_feat": x_sub_feat,  # (Nc, L, D) or None
+            "video_mask": video_mask,  # (Nc, L)
         }
         return indexed_data
 
     @torch.no_grad()
-    def get_pred_from_indexed_query(self, 
-                                    packed_q_vid, packed_q_sub,       # 来自 export_query_hash
-                                    video_query, sub_query,           # (Nq, D) 密集查询
-                                    indexed_ctx,                      # 来自 export_context_index
-                                    opt, timing_dict=None):
+    def get_pred_from_indexed_query(
+        self,
+        packed_q_vid,
+        packed_q_sub,  # 来自 export_query_hash
+        video_query,
+        sub_query,  # (Nq, D) 密集查询
+        indexed_ctx,  # 来自 export_context_index
+        opt,
+        timing_dict=None,
+    ):
         """
         [在线] 步骤: 使用预先计算的上下文索引，快速计算VR和MR分数。
         """
         self.eval()
-        do_time = (timing_dict is not None)
-        
+        do_time = timing_dict is not None
+
         # 1. 解包预加载的上下文索引 (已在GPU上)
-        packed_ctx_vid = indexed_ctx["vr_video_hash"]   # (Nc*L, nbytes)
-        packed_ctx_sub = indexed_ctx["vr_sub_hash"]   # (Nc*L, nbytes)
-        ctx_video_feat = indexed_ctx["mr_video_feat"]   # (Nc, L, D)
-        ctx_sub_feat = indexed_ctx["mr_sub_feat"]     # (Nc, L, D)
-        ctx_video_mask = indexed_ctx["video_mask"]    # (Nc, L)
+        packed_ctx_vid = indexed_ctx["vr_video_hash"]  # (Nc*L, nbytes)
+        packed_ctx_sub = indexed_ctx["vr_sub_hash"]  # (Nc*L, nbytes)
+        ctx_video_feat = indexed_ctx["mr_video_feat"]  # (Nc, L, D)
+        ctx_sub_feat = indexed_ctx["mr_sub_feat"]  # (Nc, L, D)
+        ctx_video_mask = indexed_ctx["video_mask"]  # (Nc, L)
 
         Nq = packed_q_vid.shape[0]
         Nc, L, D = ctx_video_feat.shape
-        Dh = self.hash1.encoder[-1].out_features # 哈希位数
+        Dh = self.hash1.encoder[-1].out_features  # 哈希位数
 
-        use_sub = (packed_q_sub is not None and packed_ctx_sub is not None and ctx_sub_feat is not None)
+        use_sub = (
+            packed_q_sub is not None
+            and packed_ctx_sub is not None
+            and ctx_sub_feat is not None
+        )
 
         # === 2. VR 任务 (哈希) ===
-        if do_time: t0_vr = perf_counter()
+        if do_time:
+            t0_vr = perf_counter()
 
         # 视频VR (极快)
-        matches_vid = self.hash1.xnor_popcount(packed_q_vid, packed_ctx_vid) # (Nq, Nc*L)
+        matches_vid = self.hash1.xnor_popcount(
+            packed_q_vid, packed_ctx_vid
+        )  # (Nq, Nc*L)
         # 转换回 [-1, 1] 相似度
-        sims_vid_flat = (2.0 * matches_vid.float() - float(Dh)) / float(Dh)   # (Nq, Nc*L)
+        sims_vid_flat = (2.0 * matches_vid.float() - float(Dh)) / float(
+            Dh
+        )  # (Nq, Nc*L)
         sims_vid_qnl = sims_vid_flat.view(Nq, Nc, L)
-        sims_vid_mln = sims_vid_qnl.permute(0, 2, 1).contiguous()         # (Nq, L, Nc)
+        sims_vid_mln = sims_vid_qnl.permute(0, 2, 1).contiguous()  # (Nq, L, Nc)
 
         if use_sub:
             # 字幕VR (极快)
-            matches_sub = self.hash1.xnor_popcount(packed_q_sub, packed_ctx_sub) # (Nq, Nc*L)
-            sims_sub_flat = (2.0 * matches_sub.float() - float(Dh)) / float(Dh)   # (Nq, Nc*L)
+            matches_sub = self.hash1.xnor_popcount(
+                packed_q_sub, packed_ctx_sub
+            )  # (Nq, Nc*L)
+            sims_sub_flat = (2.0 * matches_sub.float() - float(Dh)) / float(
+                Dh
+            )  # (Nq, Nc*L)
             sims_sub_qnl = sims_sub_flat.view(Nq, Nc, L)
-            sims_sub_mln = sims_sub_qnl.permute(0, 2, 1).contiguous()     # (Nq, L, Nc)
-            
+            sims_sub_mln = sims_sub_qnl.permute(0, 2, 1).contiguous()  # (Nq, L, Nc)
+
             sims_mln = (sims_vid_mln + sims_sub_mln) / 2.0
         else:
             sims_mln = sims_vid_mln
-            
+
         # 掩码 & Max-Pooling (极快)
         cm = ctx_video_mask.transpose(0, 1).unsqueeze(0)  # (1, L, Nc)
-        sims_mln = mask_logits(sims_mln, cm)              # (Nq, L, Nc)
-        q2ctx_scores = sims_mln.max(dim=1).values         # (Nq, Nc)
+        sims_mln = mask_logits(sims_mln, cm)  # (Nq, L, Nc)
+        q2ctx_scores = sims_mln.max(dim=1).values  # (Nq, Nc)
         q2ctx_scores = torch.nan_to_num(q2ctx_scores, nan=-1e4, posinf=1e4, neginf=-1e4)
-        q2ctx_scores = torch.exp(opt.q2c_alpha * q2ctx_scores) # (同原始脚本)
-        
-        if do_time: 
+        q2ctx_scores = torch.exp(opt.q2c_alpha * q2ctx_scores)  # (同原始脚本)
+
+        if do_time:
             _sync_if_cuda(opt)
             # 计时: VR分数计算 (xnor + pool)
-            timing_dict["vr_score_calc_s"] = timing_dict.get("vr_score_calc_s", 0.0) + (perf_counter() - t0_vr)
+            timing_dict["vr_score_calc_s"] = timing_dict.get("vr_score_calc_s", 0.0) + (
+                perf_counter() - t0_vr
+            )
 
         # === 3. MR 任务 (密集) ===
         # 注意: MR 仍然是密集的，需要 Nq vs Nc 的密集计算
-        if do_time: t0_mr = perf_counter()
+        if do_time:
+            t0_mr = perf_counter()
 
         # 密集相似度 (Nq, Nc, L) - 这是MR的主要开销
         similarity = self.get_merged_score(
-            video_query, ctx_video_feat, 
-            sub_query if use_sub else None, 
-            ctx_sub_feat if use_sub else None, 
-            cross=True
-        ) # (Nq, Nc, L)
+            video_query,
+            ctx_video_feat,
+            sub_query if use_sub else None,
+            ctx_sub_feat if use_sub else None,
+            cross=True,
+        )  # (Nq, Nc, L)
 
         # 扩展掩码以匹配 (Nq, Nc, L)
-        ctx_mask_expanded = ctx_video_mask.unsqueeze(0).expand(Nq, Nc, L) # (Nq, Nc, L)
-        st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, ctx_mask_expanded, cross=True)
-        
+        ctx_mask_expanded = ctx_video_mask.unsqueeze(0).expand(Nq, Nc, L)  # (Nq, Nc, L)
+        st_prob, ed_prob = self.get_merged_st_ed_prob(
+            similarity, ctx_mask_expanded, cross=True
+        )
+
         # Softmax (同原始脚本)
-        st_prob = F.softmax(st_prob, dim=-1) # (Nq, Nc, L)
+        st_prob = F.softmax(st_prob, dim=-1)  # (Nq, Nc, L)
         ed_prob = F.softmax(ed_prob, dim=-1)
 
-        if do_time: 
+        if do_time:
             _sync_if_cuda(opt)
             # 计时: MR概率计算 (dense matmul + conv)
-            timing_dict["mr_prob_calc_s"] = timing_dict.get("mr_prob_calc_s", 0.0) + (perf_counter() - t0_mr)
+            timing_dict["mr_prob_calc_s"] = timing_dict.get("mr_prob_calc_s", 0.0) + (
+                perf_counter() - t0_mr
+            )
 
         return q2ctx_scores, st_prob, ed_prob
 
@@ -885,6 +1133,7 @@ def _flatten_bits(B, mask=None):
     m = mask.reshape(-1)
     return B.reshape(-1, B.shape[-1])[m]
 
+
 def gather_bits_for_losses(bits_and_masks):
     """
     bits_and_masks: 列表，元素形如 (B, mask) 或 (B, None)
@@ -895,6 +1144,7 @@ def gather_bits_for_losses(bits_and_masks):
         pieces.append(_flatten_bits(B, m))
     return torch.cat(pieces, dim=0)  # (M, l)
 
+
 def quantization_loss(B, smooth=True):
     """
     论文式 (14):  L_q = sum |||B|-1||_1
@@ -904,9 +1154,9 @@ def quantization_loss(B, smooth=True):
     else:
         return (B.abs() - 1).abs().mean()
 
+
 def bit_balance_loss(B):
     """
     论文式 (15):  L_b = (1/l) * sum_j ( (1/N) * sum_i b_ij )^2
     """
     return (B.mean(dim=0) ** 2).mean()
-
