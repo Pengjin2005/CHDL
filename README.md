@@ -1,58 +1,65 @@
 # CHDL
 
-CHDL 是一个视频时序检索（Video Moment Retrieval）项目实现，支持基于视频、字幕和文本描述的联合检索。
-它主要面向 TVR、ActivityNet、Charades 和 DiDeMo 等数据集，提供训练、推理和评估流程。项目核心实现了带时序边界预测的多模态检索模型，并支持多种任务类型：
+[English](README.md) | [中文 (简体)](README.zh-CN.md)
 
-- VCMR：Video Corpus Moment Retrieval
-- SVMR：Single Video Moment Retrieval
-- VR：Video Retrieval
+CHDL is an implementation for video moment retrieval that supports joint retrieval using video, subtitles, and textual descriptions.
+It targets datasets such as TVR, ActivityNet, Charades, and DiDeMo, and provides training, inference, and evaluation pipelines. The core model predicts temporal moment boundaries and supports multiple retrieval tasks:
 
-## 目录结构
+- VCMR: Video Corpus Moment Retrieval
+- SVMR: Single Video Moment Retrieval
+- VR: Video Retrieval
+
+## Table of Contents
 
 - `chdl/`
-  - `train.py`：训练入口，包含模型训练、验证与自动评估流程。
-  - `inference.py`：推理入口，用于加载 checkpoint 并生成提交结果。
-  - `config.py`：训练/测试选项定义，包含数据、模型、优化和后处理参数。
-  - `dataset.py`：数据集加载与预处理逻辑，支持 `jsonl` 数据格式和 HDF5 特征。
-  - `model.py`：CHDL 模型定义及前向计算。
-  - `optimization.py`：优化器、学习率调度和自定义 Adam 实现。
-  - `components.py`：模型组件，包括注意力、位置编码、卷积和时序定位模块。
-  - `utils.py`：模型辅助工具函数。
+  - `train.py`: Training entry point with training, validation and automatic evaluation workflows.
+  - `inference.py`: Inference entry point to load a checkpoint and produce submission files.
+  - `config.py`: Training/testing option definitions, including data, model, optimization and post-processing settings.
+  - `dataset.py`: Dataset loading and preprocessing logic. Supports JSONL and HDF5 feature files.
+  - `model.py`: CHDL model definition and forward pass.
+  - `optimization.py`: Optimizers, LR schedules and a custom Adam implementation.
+  - `components.py`: Model components such as attention, positional encodings, conv heads and temporal localization modules.
+  - `utils.py`: Model helper utilities.
 - `eval/`
-  - `eval.py`：检索结果评估工具，支持 R@K、IoU 等指标。
+  - `eval.py`: Evaluation utilities for retrieval metrics (R@K, IoU, etc.).
 - `utils/`
-  - `basic_utils.py`、`tensor_utils.py`、`model_utils.py` 等通用工具。
-  - `video_feature/`：视频特征提取与处理脚本。
-  - `text_feature/`：文本特征预处理与导出脚本。
-- `setup.sh`：将当前仓库根目录加入 `PYTHONPATH`，方便直接运行 Python 脚本。
+  - `basic_utils.py`, `tensor_utils.py`, `model_utils.py` and other reusable helpers.
+  - `video_feature/`: Video feature extraction and conversion scripts.
+  - `text_feature/`: Text feature preprocessing and export scripts.
+- `setup.sh`: Adds the project root to `PYTHONPATH` for convenient execution.
 
-## 依赖环境
+## Requirements
 
+Create a Python environment and install the main dependencies:
 
 ```bash
 python -m pip install torch torchvision torchaudio
 python -m pip install numpy tqdm easydict tensorboard h5py
 ```
 
-## 快速开始
+Additional packages (e.g. `scipy`, `pandas`) may be required depending on your workflow.
 
-1. 进入仓库根目录：
+## Quick Start
+
+1. Change into the repository root:
 
 ```bash
 cd /home/jynp/CHDL
 ```
 
-2. 启用项目路径：
+2. Enable the project path:
 
 ```bash
 source setup.sh
 ```
 
-3. 运行训练命令前，请准备好数据集 JSONL 文件和特征文件。
+3. Prepare dataset JSONL files and feature HDF5 files before training.
 
-## 训练
+## Training
 
-训练入口为 `chdl/train.py`。
+Training entrypoint is `chdl/train.py`.
+
+Example:
 
 ```bash
 python chdl/train.py \
@@ -70,40 +77,42 @@ python chdl/train.py \
   --n_epoch 100
 ```
 
-### 训练参数说明
+### Training arguments (high level)
 
-- `--exp_id`：本次训练 experiment id，必须指定。
-- `--dset_name`：数据集名称，可选 `tvr`, `activitynet`, `charades`, `didemo`。
-- `--ctx_mode`：上下文模式，可选 `video`, `sub`, `tef`, `video_sub`, `video_tef`, `sub_tef`, `video_sub_tef`。
-- `--train_path`：训练集 JSONL 文件路径。
-- `--eval_path`：验证集 JSONL 文件路径，训练过程中用于验证与早停。
-- `--vid_feat_path`：视频特征 HDF5 路径。
-- `--desc_bert_path`：描述文本特征 HDF5 路径。
-- `--sub_bert_path`：字幕文本特征 HDF5 路径，仅当 `ctx_mode` 包含 `sub` 时需要。
-- `--bsz`：训练批次大小。
-- `--lr`：优化器学习率。
-- `--n_epoch`：训练轮数。
-- `--results_root`：结果目录根路径，默认 `results`。
+- `--exp_id`: Experiment id for this run (required).
+- `--dset_name`: Dataset name, one of `tvr`, `activitynet`, `charades`, `didemo`.
+- `--ctx_mode`: Context mode. Options: `video`, `sub`, `tef`, `video_sub`, `video_tef`, `sub_tef`, `video_sub_tef`.
+- `--train_path`: Path to the training JSONL file.
+- `--eval_path`: Path to the validation JSONL file (used for validation/early stop during training).
+- `--vid_feat_path`: Path to video feature HDF5.
+- `--desc_bert_path`: Path to description BERT/Roberta features HDF5.
+- `--sub_bert_path`: Path to subtitle BERT features HDF5 (required when `ctx_mode` includes `sub`).
+- `--bsz`: Training batch size.
+- `--lr`: Learning rate.
+- `--n_epoch`: Number of training epochs.
+- `--results_root`: Root folder for results (default: `results`).
 
-### 训练后输出
+### Training outputs
 
-训练时会在 `results/` 下创建目录，目录名格式类似：
+Training creates a results directory under `results/`. Example:
 
 ```
 results/tvr-video_sub-my_experiment-YYYY_MM_DD_hh_mm_ss
 ```
 
-目录内通常包含：
+Typical contents:
 
-- `model.ckpt`：保存的模型 checkpoint
-- `train.log.txt`：训练损失日志
-- `eval.log.txt`：验证指标日志
-- `tensorboard_log/`：TensorBoard 日志
-- `code.zip`：训练时保存的代码快照
+- `model.ckpt`: Saved model checkpoint
+- `train.log.txt`: Training loss logs
+- `eval.log.txt`: Validation metrics logs
+- `tensorboard_log/`: TensorBoard logs
+- `code.zip`: Code snapshot saved at training time
 
-## 推理与评估
+## Inference & Evaluation
 
-推理入口为 `chdl/inference.py`。
+Inference entrypoint is `chdl/inference.py`.
+
+Example:
 
 ```bash
 python chdl/inference.py \
@@ -119,75 +128,77 @@ python chdl/inference.py \
   --tasks VCMR SVMR VR
 ```
 
-> 注意：`--model_dir` 需指定模型所在结果目录在 `chdl/results/` 下的目录名，而不是完整路径。
+> Note: `--model_dir` should point to the model results directory name under `chdl/results/`, not an absolute path.
 
-### 推理参数说明
+### Inference arguments
 
-- `--model_dir`：训练产生的结果目录名（相对于 `chdl/results/`）。
-- `--eval_id`：本次推理 ID，用于生成输出文件名。
-- `--tasks`：要运行的任务，可选 `VCMR`, `SVMR`, `VR`。
-- `--nms_thd`：如果设置为非 `-1`，会对预测结果进行 NMS 后再评估。
+- `--model_dir`: Name of the results folder created during training (relative to `chdl/results/`).
+- `--eval_id`: Identifier for this inference run (used in output filenames).
+- `--tasks`: Tasks to run: `VCMR`, `SVMR`, `VR`.
+- `--nms_thd`: If set to a value other than `-1`, NMS will be applied to predictions before evaluation.
 
-### 推理输出
+### Inference outputs
 
-推理结果会保存为 JSON 文件，目录通常在：
+Predictions are saved as JSON files under the model results folder, for example:
 
 ```
 chdl/results/<model_dir>/inference_<dset_name>_<split>_<eval_id>_predictions_<tasks>.json
 ```
 
-如果验证集带有标注，代码会自动计算评估指标，并将结果写入 `_metrics.json`。
+If ground-truth annotations are available (e.g., `val` split), evaluation metrics are computed and written to a `_metrics.json` alongside predictions.
 
-## 数据格式与预处理
+## Data format & preprocessing
 
-### JSONL 数据格式
+### JSONL schema
 
-`chdl/dataset.py` 支持 JSONL 输入，基本字段包括：
+`chdl/dataset.py` accepts JSONL files. Typical fields supported include:
 
 - `desc_id` / `id`
 - `desc` / `fig_desc` / `cog_desc` / `text`
 - `vid_name` / `video` / `video_id`
 - `duration`
-- `ts` / `time`（时间戳边界）
+- `ts` / `time` (timestamp span)
 
-对于不同数据集，代码已兼容多种字段命名。
+The loader is compatible with multiple field name variants across datasets.
 
-### 特征数据
+### Feature files
 
-项目依赖 HDF5 特征文件：
+The project relies on HDF5 feature files:
 
-- 视频特征：如 ResNet、I3D、ResNet+I3D 拼接特征
-- 文本描述特征：BERT/Roberta 提取的描述特征
-- 字幕特征：仅当使用 `sub` 模式时需要
+- Video features: ResNet, I3D, or concatenated ResNet+I3D
+- Text features: BERT/Roberta embeddings for descriptions
+- Subtitle features: used when `sub` mode is enabled
 
-特征文件通常为 `.h5` 格式，可使用 `utils/video_feature` 与 `utils/text_feature` 下的脚本进行转换与提取。
+Feature conversion and extraction scripts are available under `utils/video_feature` and `utils/text_feature`.
 
-## 评估指标
+## Evaluation metrics
 
-评估工具位于 `eval/eval.py`，支持计算：
+Evaluation utilities are in `eval/eval.py` and support:
 
-- R@K（Recall@1, @5, @10, @100）
-- IoU 阈值：`0.5`, `0.7`
-- 任务类型：`VCMR`, `SVMR`, `VR`
+- R@K (Recall@1, @5, @10, @100)
+- IoU thresholds: `0.5`, `0.7`
+- Task types: `VCMR`, `SVMR`, `VR`
 
-如果 `eval_split_name` 为 `val`，推理时会自动对生成结果执行评估。
+If `eval_split_name` is `val`, inference runs will automatically compute and save metrics.
 
-## 调试与快速验证
+## Debugging & quick checks
 
-- `--debug`：进入快速调试模式，降低数据加载和训练规模。
-- `--data_ratio`：只使用部分数据进行训练/验证，例如 `--data_ratio 0.1`。
-- `--no_core_driver`：禁用 HDF5 `core` driver，适用于不希望全部映射到内存的情况。
+- `--debug`: Run in debug (fast) mode with reduced data/loops.
+- `--data_ratio`: Use a fraction of the data, e.g. `--data_ratio 0.1`.
+- `--no_core_driver`: Disable HDF5 `core` driver to avoid loading entire files into RAM.
 
-## 备注
+## Notes
 
-- `setup.sh` 会将仓库根目录加入 `PYTHONPATH`，建议在执行 Python 脚本前先运行 `source setup.sh`。
-- 如果使用多 GPU，可通过 `--device_ids 0 1` 指定多个 GPU。
-- 模型训练结束后，`chdl/train.py` 会自动对当前最佳模型执行一次推理评估。
+- Run `source setup.sh` before executing Python scripts to add the project root to `PYTHONPATH`.
+- For multi-GPU training use `--device_ids 0 1`.
+- After training, `chdl/train.py` triggers a single inference/evaluation on the best saved checkpoint.
 
-## 扩展
+## Extending & Reproducing
 
-如果你希望在已有数据集上复现实验，可参考 `chdl/scripts` 中的 shell 示例，按数据集名称和特征路径调整参数。
+See `chdl/scripts` for shell examples that demonstrate dataset-specific commands and parameter settings.
 
 ---
 
-如果你需要，我也可以进一步补充一份“数据准备与特征提取”章节，包含 `utils/video_feature` / `utils/text_feature` 的常用命令。
+The original Chinese localization has been preserved in `README.zh-CN.md`.
+
+If you want, I can also add a dedicated "Data preparation & feature extraction" section with concrete commands for the scripts under `utils/video_feature` and `utils/text_feature`.
